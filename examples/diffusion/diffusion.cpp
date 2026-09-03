@@ -100,6 +100,254 @@ static std::vector<int32_t> get_num_transfer_tokens(int32_t mask_count, int32_t 
     return num_transfer_tokens;
 }
 
+static bool model_is_sdar(const llama_model * model) {
+    char architecture[16] = {};
+    return llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) >= 0 &&
+           strcmp(architecture, "sdar") == 0;
+}
+
+static void set_sdar_batch(llama_batch &       batch,
+                           const llama_token * tokens,
+                           int32_t             block_start,
+                           int32_t             block_end,
+                           bool                logits_all) {
+    batch.n_tokens = block_end - block_start;
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        batch.token[i]     = tokens[block_start + i];
+        batch.pos[i]       = block_start + i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = logits_all || i == batch.n_tokens - 1;
+    }
+}
+
+static void diffusion_generate_sdar(llama_context *          ctx,
+                                    const llama_token *      input_tokens,
+                                    llama_token *            output_tokens,
+                                    int32_t                  n_input,
+                                    const diffusion_params & params,
+                                    int32_t &                n_generated) {
+    if (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED || params.block_length <= 0 || params.steps <= 0) {
+        LOG_ERR("%s: SDAR requires a positive block length and denoising step count\n", __func__);
+        return;
+    }
+    if (params.cfg_scale != 0.0f) {
+        LOG_ERR("%s: classifier-free guidance is not supported for SDAR\n", __func__);
+        return;
+    }
+    if (params.algorithm != DIFFUSION_ALGORITHM_CONFIDENCE_BASED) {
+        LOG_ERR("%s: SDAR currently supports only confidence-based remasking\n", __func__);
+        return;
+    }
+
+    const int32_t total_length = params.max_length / params.block_length * params.block_length;
+    if (total_length <= n_input) {
+        LOG_ERR("%s: max length must leave room for at least one SDAR block\n", __func__);
+        return;
+    }
+
+    const llama_model * model   = llama_get_model(ctx);
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+    llama_memory_t      memory  = llama_get_memory(ctx);
+    if (!memory) {
+        LOG_ERR("%s: SDAR requires a KV cache\n", __func__);
+        return;
+    }
+
+    std::copy(input_tokens, input_tokens + n_input, output_tokens);
+    std::fill(output_tokens + n_input, output_tokens + params.max_length, params.mask_token_id);
+
+    llama_set_causal_attn(ctx, false);
+    llama_memory_clear(memory, true);
+
+    std::mt19937                  rng(params.seed);
+    std::vector<llama_token_data> candidates(n_vocab);
+    std::vector<int32_t>          mask_positions;
+    mask_positions.reserve(params.block_length);
+
+    llama_sampler * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (params.temperature > 0.0f) {
+        if (params.top_k > 0) {
+            llama_sampler_chain_add(sampler, llama_sampler_init_top_k(params.top_k));
+        }
+        if (params.top_p < 1.0f) {
+            llama_sampler_chain_add(sampler, llama_sampler_init_top_p(params.top_p, 1));
+        }
+        llama_sampler_chain_add(sampler, llama_sampler_init_temp(params.temperature));
+        llama_sampler_chain_add(sampler, llama_sampler_init_dist(params.seed));
+    }
+
+    llama_batch batch = llama_batch_init(params.block_length, 0, 1);
+
+    const int32_t n_blocks       = total_length / params.block_length;
+    const int32_t n_prefill      = n_input / params.block_length;
+    const int32_t n_decode       = n_blocks - n_prefill;
+    const int32_t callback_steps = n_decode * params.steps;
+    int32_t       steps_done     = 0;
+    int64_t       sampling_time  = 0;
+    const int64_t time_start     = ggml_time_us();
+
+    for (int32_t block = 0; block < n_prefill; ++block) {
+        const int32_t block_start = block * params.block_length;
+        const int32_t block_end   = block_start + params.block_length;
+        set_sdar_batch(batch, output_tokens, block_start, block_end, false);
+        if (llama_decode(ctx, batch) != 0) {
+            LOG_ERR("%s: failed to prefill block %d\n", __func__, block);
+            llama_batch_free(batch);
+            llama_sampler_free(sampler);
+            return;
+        }
+    }
+
+    const std::vector<int32_t> num_transfer_tokens = get_num_transfer_tokens(params.block_length, params.steps);
+
+    for (int32_t block = n_prefill; block < n_blocks; ++block) {
+        const int32_t block_start = block * params.block_length;
+        const int32_t block_end   = block_start + params.block_length;
+
+        for (int32_t step = 0; step < params.steps; ++step) {
+            mask_positions.clear();
+            for (int32_t pos = block_start; pos < block_end; ++pos) {
+                if (output_tokens[pos] == params.mask_token_id) {
+                    mask_positions.push_back(pos);
+                }
+            }
+            if (mask_positions.empty()) {
+                break;
+            }
+
+            if (params.step_callback && !params.step_callback(steps_done, callback_steps, output_tokens, total_length,
+                                                              params.step_callback_user_data)) {
+                llama_batch_free(batch);
+                llama_sampler_free(sampler);
+                return;
+            }
+
+            set_sdar_batch(batch, output_tokens, block_start, block_end, true);
+            const int ret = llama_decode(ctx, batch);
+            if (ret != 0) {
+                llama_memory_seq_rm(memory, 0, block_start, -1);
+                LOG_ERR("%s: failed to denoise block %d at step %d, ret = %d\n", __func__, block, step, ret);
+                llama_batch_free(batch);
+                llama_sampler_free(sampler);
+                return;
+            }
+
+            float * logits = llama_get_logits(ctx);
+            if (!logits) {
+                llama_memory_seq_rm(memory, 0, block_start, -1);
+                LOG_ERR("%s: failed to get logits for block %d at step %d\n", __func__, block, step);
+                llama_batch_free(batch);
+                llama_sampler_free(sampler);
+                return;
+            }
+
+            const int64_t                          time_start_sampling = ggml_time_us();
+            std::vector<std::pair<float, int32_t>> confidences;
+            std::vector<llama_token>               sampled_tokens(mask_positions.size());
+            confidences.reserve(mask_positions.size());
+
+            for (size_t i = 0; i < mask_positions.size(); ++i) {
+                const int32_t local_pos  = mask_positions[i] - block_start;
+                float *       pos_logits = logits + local_pos * n_vocab;
+                if (params.add_gumbel_noise && params.temperature > 0.0f) {
+                    add_gumbel_noise(pos_logits, n_vocab, params.temperature, rng);
+                }
+
+                for (int32_t token_id = 0; token_id < n_vocab; ++token_id) {
+                    candidates[token_id].id    = token_id;
+                    candidates[token_id].logit = pos_logits[token_id];
+                    candidates[token_id].p     = 0.0f;
+                }
+
+                if (params.temperature > 0.0f) {
+                    llama_token_data_array cur_p = {
+                        candidates.data(),
+                        candidates.size(),
+                        -1,
+                        false,
+                    };
+                    llama_sampler_apply(sampler, &cur_p);
+                    sampled_tokens[i] = cur_p.data[cur_p.selected].id;
+                    confidences.emplace_back(calculate_confidence(cur_p, params.algorithm, rng), i);
+                } else {
+                    const auto max_it = std::max_element(
+                        candidates.begin(), candidates.end(),
+                        [](const llama_token_data & a, const llama_token_data & b) { return a.logit < b.logit; });
+                    const float max_logit = max_it->logit;
+                    double      sum       = 0.0;
+                    for (const llama_token_data & candidate : candidates) {
+                        sum += std::exp(candidate.logit - max_logit);
+                    }
+                    sampled_tokens[i] = max_it->id;
+                    confidences.emplace_back(1.0f / sum, i);
+                }
+            }
+
+            const int32_t transfer_count = std::min<int32_t>(num_transfer_tokens[step], mask_positions.size());
+            std::partial_sort(confidences.begin(), confidences.begin() + transfer_count, confidences.end(),
+                              [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
+                                  if (a.first != b.first) {
+                                      return a.first > b.first;
+                                  }
+                                  return a.second < b.second;
+                              });
+            for (int32_t i = 0; i < transfer_count; ++i) {
+                const int32_t mask_index                  = confidences[i].second;
+                output_tokens[mask_positions[mask_index]] = sampled_tokens[mask_index];
+            }
+
+            sampling_time += ggml_time_us() - time_start_sampling;
+            ++steps_done;
+
+            if (!llama_memory_seq_rm(memory, 0, block_start, -1)) {
+                LOG_ERR("%s: failed to roll back temporary KV for block %d\n", __func__, block);
+                llama_batch_free(batch);
+                llama_sampler_free(sampler);
+                return;
+            }
+        }
+
+        for (int32_t pos = block_start; pos < block_end; ++pos) {
+            if (output_tokens[pos] == params.mask_token_id) {
+                LOG_ERR("%s: block %d still contains mask tokens after %d steps\n", __func__, block, params.steps);
+                llama_batch_free(batch);
+                llama_sampler_free(sampler);
+                return;
+            }
+        }
+
+        set_sdar_batch(batch, output_tokens, block_start, block_end, false);
+        if (llama_decode(ctx, batch) != 0) {
+            LOG_ERR("%s: failed to commit KV for block %d\n", __func__, block);
+            llama_batch_free(batch);
+            llama_sampler_free(sampler);
+            return;
+        }
+
+        for (int32_t pos = std::max(block_start, n_input); pos < block_end; ++pos) {
+            if (llama_vocab_is_eog(vocab, output_tokens[pos])) {
+                n_generated = pos + 1;
+                block       = n_blocks;
+                break;
+            }
+        }
+    }
+
+    if (n_generated == 0) {
+        n_generated = total_length;
+    }
+
+    const int64_t total_time = ggml_time_us() - time_start;
+    LOG_INF("\nSDAR total time: %0.2fms, time per denoising step: %0.2fms, sampling time per step: %0.2fms\n",
+            total_time / 1000.0, steps_done > 0 ? total_time / 1000.0 / steps_done : 0.0,
+            steps_done > 0 ? sampling_time / 1000.0 / steps_done : 0.0);
+
+    llama_batch_free(batch);
+    llama_sampler_free(sampler);
+}
+
 void diffusion_generate(llama_context *          ctx,
                         const llama_token *      input_tokens,
                         llama_token *            output_tokens,
@@ -112,6 +360,11 @@ void diffusion_generate(llama_context *          ctx,
     }
 
     const llama_model * model = llama_get_model(ctx);
+
+    if (model_is_sdar(model)) {
+        diffusion_generate_sdar(ctx, input_tokens, output_tokens, n_input, params, n_generated);
+        return;
+    }
 
     // Initialize with input and pad with mask tokens
     std::copy(input_tokens, input_tokens + n_input, output_tokens);

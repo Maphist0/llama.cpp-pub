@@ -186,8 +186,15 @@ int main(int argc, char ** argv) {
         diff_params.shift_logits = true;
     }
 
-    //Use either eps or block length, but not both
-    GGML_ASSERT((params.diffusion.eps == 0) ^ (params.diffusion.block_length == 0));
+    // Use either eps or block length, but not both.
+    if ((params.diffusion.eps == 0) == (params.diffusion.block_length == 0)) {
+        LOG_ERR(
+            "error: specify exactly one positive diffusion schedule: --diffusion-eps or --diffusion-block-length\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        llama_backend_free();
+        return 1;
+    }
 
     if (params.diffusion.eps) {
         diff_params.schedule = DIFFUSION_TRANSFER_SCHEDULE_TIMESTEP_BASED;
@@ -245,12 +252,14 @@ int main(int argc, char ** argv) {
 
     diffusion_generate(ctx, input_tokens.data(), output_tokens.data(), n_input, diff_params, n_generated);
 
-    if (n_generated > 0) {
+    const bool generation_succeeded = n_generated > n_input;
+    if (generation_succeeded) {
         if (visual_mode) {
             //clear screen and move cursor to top-left
             LOG_INF("\033[2J\033[H");
         }
 
+        output_tokens.resize(n_generated);
         output_tokens.erase(output_tokens.begin(), output_tokens.begin() + n_input);
         std::string output_data = common_detokenize(vocab, output_tokens, false);
         LOG_INF("\n%s\n", output_data.c_str());
@@ -262,5 +271,5 @@ int main(int argc, char ** argv) {
     llama_model_free(model);
     llama_backend_free();
 
-    return 0;
+    return generation_succeeded ? 0 : 1;
 }

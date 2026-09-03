@@ -57,3 +57,10 @@ llama-diffusion-cli -m llada-8b.gguf -p "write code to train MNIST in pytorch" -
 ```
 llama-diffusion-cli -m RND1-Base-0910.gguf -p "write code to train MNIST in pytorch" -ub 512 --diffusion-algorithm 1 --diffusion-steps 256 --diffusion-visual --temp 0.5 --diffusion-eps 0.001
 ```
+
+#### SDAR architecture:
+```
+llama-diffusion-cli -m SDAR-4B-Chat-Q4_K_M.gguf -p "What is the capital of France? Answer briefly." -c 64 -ub 64 --diffusion-block-length 4 --diffusion-steps 4 --diffusion-algorithm 4 --temp 0
+```
+
+For SDAR, `--diffusion-steps` is the number of denoising steps per block. The prompt is formatted with the model's chat template by default.
