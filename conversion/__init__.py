@@ -240,6 +240,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Qwen4ExpForCausalLM": "qwen4exp",
     "Qwen4ExpForConditionalGeneration": "qwen4exp",
     "RND1": "qwen",
+    "SDARForCausalLM": "qwen",
     "RWForCausalLM": "falcon",
     "RWKV6Qwen2ForCausalLM": "rwkv",
     "RWKV7ForCausalLM": "rwkv",

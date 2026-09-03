@@ -109,7 +109,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_layer = 4;
     } else if (arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_LAGUNA) {
         n_embd = 160; // exercise per-head tensor split granularity with head size 80
-    } else if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
+    } else if (arch == LLM_ARCH_QWEN3
+            || arch == LLM_ARCH_SDAR
+            || arch == LLM_ARCH_MUSE_GLIMMER
+            || arch == LLM_ARCH_AFMOE) {
         n_head = 4;
     } else if (arch == LLM_ARCH_DEEPSEEK2
             || arch == LLM_ARCH_DEEPSEEK32
@@ -131,7 +134,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     }
 
     uint32_t n_head_kv = n_head;
-    if (arch == LLM_ARCH_QWEN3) {
+    if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_SDAR) {
         n_head_kv = 1; // MQA coverage
     } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
         n_head_kv = 2; // GQA coverage
@@ -394,6 +397,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         llama_model_load_from_file_ptr(file, model_params));
     if (!model) {
         throw std::runtime_error("failed to create llama model");
+    }
+    if (llama_model_is_diffusion(model.get())) {
+        ctx_params.n_ubatch = 256;
     }
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
     if (!lctx) {

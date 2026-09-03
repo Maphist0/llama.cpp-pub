@@ -255,6 +255,31 @@ class Qwen3Model(Qwen2Model):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("SDARForCausalLM")
+@ModelBase.example("JetLM/SDAR-4B-Chat")
+class SDARModel(Qwen3Model):
+    model_arch = gguf.MODEL_ARCH.SDAR
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_causal_attention(False)
+        self.gguf_writer.add_diffusion_shift_logits(False)
+
+        mask_token_id = self.hparams.get("mask_token_id")
+        if mask_token_id is None:
+            with (self.dir_model / "tokenizer_config.json").open("r", encoding="utf-8") as f:
+                tokenizer_config = json.load(f)
+            mask_token = tokenizer_config.get("mask_token")
+            mask_token_id = next((
+                int(token_id)
+                for token_id, token_data in tokenizer_config.get("added_tokens_decoder", {}).items()
+                if token_data.get("content") == mask_token
+            ), None)
+        if mask_token_id is None:
+            raise ValueError("SDAR mask token ID is missing from model and tokenizer metadata")
+        self.gguf_writer.add_mask_token_id(mask_token_id)
+
+
 @ModelBase.register("Qwen3MoeForCausalLM")
 @ModelBase.example("Qwen/Qwen3-30B-A3B")
 class Qwen3MoeModel(Qwen2MoeModel):
