@@ -557,6 +557,9 @@ struct ggml_backend_opencl_context {
 
     GPU_FAMILY gpu_family;
     ADRENO_GPU_GEN adreno_gen;
+    bool adreno_tuned_kernels = false;
+    int q4_k_splits = 4;
+    static constexpr int q6_k_splits = 32;
 
     cl_int alignment;
     size_t global_mem_size;
@@ -613,6 +616,7 @@ struct ggml_backend_opencl_context {
     ggml_cl_buffer prealloc_quant_trans;
     ggml_cl_buffer prealloc_scales_trans;
     ggml_cl_buffer prealloc_act_trans;
+    ggml_cl_buffer prealloc_k_quant_split;
     // q8_1-quantized reordered MoE activations for the dp4a prefill GEMM.
     ggml_cl_buffer prealloc_moe_qa;   // int8 quants  [tok_slots * ne00]
     ggml_cl_buffer prealloc_moe_da;   // per-block d  [tok_slots * ne00/32] (half)
@@ -1095,6 +1099,13 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_gemv_noshuffle_q1_0_f32;
     cl_kernel kernel_gemv_noshuffle_q4_k_f32;
     cl_kernel kernel_gemm_noshuffle_q4_k_f32;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_split_k_4x8 = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q4_k_f32_split_k_2x4 = nullptr;
+    cl_kernel kernel_q4_split_k_2x4_s8 = nullptr;
+    cl_kernel kernel_q4_split_k_reduce_s8 = nullptr;
+    cl_kernel kernel_reduce_q4_k_split_k = nullptr;
+    cl_kernel kernel_gemm_noshuffle_q6_k_f32_split_k_4x8 = nullptr;
+    cl_kernel kernel_reduce_q6_k_split_k = nullptr;
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a = nullptr;  // dp4a (int8) dense prefill GEMM
     cl_kernel kernel_gemm_noshuffle_q4_k_q8_1_dp4a_wimg = nullptr;  // dp4a dense prefill GEMM, weights via texture (X1 opt-in)
     cl_kernel kernel_gemm_noshuffle_q5_k_q8_1_dp4a = nullptr;  // dp4a (int8) dense q5_K prefill GEMM
@@ -3837,6 +3848,30 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
+    // Adreno 740 floating-point tiles for narrow dense projections.
+    if (backend_ctx->adreno_tuned_kernels) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_noshuffle_q4_k_f32_split_k.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_noshuffle_q4_k_f32_split_k.cl");
+#endif
+        std::string q4_options = compile_opts + " -DK_SPLITS=" + std::to_string(backend_ctx->q4_k_splits);
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), q4_options);
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_split_k_4x8 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_split_k_4x8", &err), err));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q4_k_f32_split_k_2x4 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_split_k_2x4", &err), err));
+        CL_CHECK((backend_ctx->kernel_reduce_q4_k_split_k = clCreateKernel(prog, "kernel_reduce_q4_k_split_k", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        const char * shape_splits = getenv("GGML_OPENCL_SDAR_SHAPE_SPLITS");
+        if ((!shape_splits || atoi(shape_splits) != 0) && backend_ctx->q4_k_splits == 4) {
+            prog = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts + " -DK_SPLITS=8 -Dkernel_gemm_noshuffle_q4_k_f32_split_k_2x4=kernel_gemm_noshuffle_q4_k_f32_split_k_2x4_s8 -Dkernel_reduce_q4_k_split_k=kernel_reduce_q4_k_split_k_s8");
+            CL_CHECK((backend_ctx->kernel_q4_split_k_2x4_s8 = clCreateKernel(prog, "kernel_gemm_noshuffle_q4_k_f32_split_k_2x4_s8", &err), err));
+            CL_CHECK((backend_ctx->kernel_q4_split_k_reduce_s8 = clCreateKernel(prog, "kernel_reduce_q4_k_split_k_s8", &err), err));
+            CL_CHECK(clReleaseProgram(prog));
+        }
+    }
+
     // gemm_noshuffle_q4_k_q8_1_dp4a (dp4a dense prefill GEMM)
     if (backend_ctx->has_integer_dot) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -4583,6 +4618,20 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_K_f32 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_K_f32", &err), err));
         GGML_LOG_CONT(".");
+    }
+
+    if (backend_ctx->adreno_tuned_kernels) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "gemm_noshuffle_q6_k_f32_split_k.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("gemm_noshuffle_q6_k_f32_split_k.cl");
+#endif
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), CL_moe_compile_opts + " -DK_SPLITS=" + std::to_string(backend_ctx->q6_k_splits));
+        CL_CHECK((backend_ctx->kernel_gemm_noshuffle_q6_k_f32_split_k_4x8 = clCreateKernel(prog, "kernel_gemm_noshuffle_q6_k_f32_split_k_4x8", &err), err));
+        CL_CHECK((backend_ctx->kernel_reduce_q6_k_split_k = clCreateKernel(prog, "kernel_reduce_q6_k_split_k", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
     }
 
     // gemv_noshuffle_q5_k_f32
@@ -5962,6 +6011,15 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 
     backend_ctx->gpu_family = dev_ctx->gpu_family;
     backend_ctx->adreno_gen = dev_ctx->adreno_gen;
+    backend_ctx->adreno_tuned_kernels = dev_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
+                                  dev_ctx->device_version.find("Adreno(TM) 740") != std::string::npos;
+    if (const char * e = getenv("GGML_OPENCL_ADRENO_TUNED_KERNELS")) {
+        backend_ctx->adreno_tuned_kernels = backend_ctx->adreno_tuned_kernels && atoi(e) != 0;
+    }
+    if (const char * e = getenv("GGML_OPENCL_SDAR_Q4_SPLITS")) {
+        const int splits = atoi(e);
+        if (splits == 2 || splits == 4 || splits == 8 || splits == 16) backend_ctx->q4_k_splits = splits;
+    }
     if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
         ggml_cl_init_fa_dims_table();
 
@@ -18092,6 +18150,19 @@ static void ggml_cl_mul_mat_q8_0_f32_adreno(ggml_backend_t backend, const ggml_t
 #endif
 }
 
+static void ggml_cl_reduce_k_quant_split(ggml_backend_opencl_context * ctx, cl_kernel kernel, ggml_tensor * dst) {
+    auto * extra = (ggml_tensor_extra_cl *) dst->extra;
+    cl_ulong offset = extra->offset + dst->view_offs;
+    cl_int count = (cl_int) ggml_nelements(dst);
+    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &ctx->prealloc_k_quant_split.buffer));
+    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->data_device));
+    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_ulong), &offset));
+    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_int), &count));
+    size_t local[1] = {64};
+    size_t global[1] = {(size_t)CEIL_DIV(count, 256) * 64};
+    ctx->enqueue_ndrange_kernel(kernel, 1, global, local, dst);
+}
+
 static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     GGML_ASSERT(src0);
@@ -18340,6 +18411,31 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
 
         // gemm
         kernel = backend_ctx->kernel_gemm_noshuffle_q4_k_f32;
+        // These projection shapes were measured on Adreno 740 at widths 4-128.
+        // Small token tiles expose more workgroups; wider FFNs favor weight reuse.
+        const bool split_k_shape = backend_ctx->adreno_tuned_kernels &&
+            ((ne00 == 2560 && (ne01 == 1024 || ne01 == 4096 || ne01 == 9728)) ||
+             (ne01 == 2560 && (ne00 == 4096 || ne00 == 9728)));
+        const bool split_k_2x4 = split_k_shape &&
+            (ne1 <= 4 || (ne1 <= 16 && ne01 != 9728) || (ne01 == 1024 && ne1 <= 64));
+        const bool split_k_4x8 = split_k_shape && !split_k_2x4 &&
+            (ne1 <= 32 || (ne01 == 9728 && ne1 <= 64)) &&
+            !(ne01 == 9728 && ne1 > 8 && ne1 <= 16);
+        if (split_k_2x4) {
+            kernel = backend_ctx->kernel_gemm_noshuffle_q4_k_f32_split_k_2x4;
+        } else if (split_k_4x8) {
+            kernel = backend_ctx->kernel_gemm_noshuffle_q4_k_f32_split_k_4x8;
+        }
+        const bool shape_s8 = split_k_2x4 && ne1 == 4 && (ne01 == 1024 || ne01 == 2560) && backend_ctx->kernel_q4_split_k_2x4_s8;
+        if (shape_s8) kernel = backend_ctx->kernel_q4_split_k_2x4_s8;
+        const int splits = shape_s8 ? 8 : (split_k_2x4 || split_k_4x8) ? backend_ctx->q4_k_splits : 1;
+        cl_mem result_buffer = extrad->data_device;
+        cl_ulong result_offset = offsetd;
+        if (splits > 1) {
+            backend_ctx->prealloc_k_quant_split.allocate(context, (size_t)ne01 * ne1 * splits * sizeof(float));
+            result_buffer = backend_ctx->prealloc_k_quant_split.buffer;
+            result_offset = 0;
+        }
         int padded_N = N + padding;
 
         CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0_q4_k->q));
@@ -18347,8 +18443,8 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra0_q4_k->d));
         CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem),   &extra0_q4_k->dm));
         CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &b_img_trans));
-        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_mem),   &extrad->data_device));
-        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_mem),   &result_buffer));
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &result_offset));
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne01));
         CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &padded_N));
         CL_CHECK(clSetKernelArg(kernel, 9, sizeof(cl_int),   &ne00));
@@ -18357,10 +18453,14 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_uchar), &mask_d4));
         CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_uchar), &mask_hi2));
 
-        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne1, 8), (size_t)CEIL_DIV(ne01, 4), 1};
-        size_t local_work_size[3] = {1, 128, 1};
+        const int tile_n = split_k_2x4 ? 4 : 8;
+        const int tile_m = split_k_2x4 ? 2 : 4;
+        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne1, tile_n), (size_t)CEIL_DIV(ne01, tile_m), (size_t)splits};
+        size_t local_work_size[3] = {1, (size_t)(split_k_2x4 || split_k_4x8 ? 64 : 128), 1};
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+        if (splits > 1) ggml_cl_reduce_k_quant_split(backend_ctx,
+            shape_s8 ? backend_ctx->kernel_q4_split_k_reduce_s8 : backend_ctx->kernel_reduce_q4_k_split_k, dst);
         CL_CHECK(clReleaseMemObject(b_sub_buf));
         CL_CHECK(clReleaseMemObject(b_sub_buf_trans));
         CL_CHECK(clReleaseMemObject(b_img));
@@ -18477,10 +18577,16 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK((b_sub_buf = clCreateSubBuffer(extra1->data_device, 0, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
 
         // dp4a (int8) dense q6_K prefill GEMM
+        const bool split_k_shape = backend_ctx->adreno_tuned_kernels && ne1 <= 128 &&
+            ((ne00 == 2560 && ne01 == 1024) || (ne00 == 9728 && ne01 == 2560));
+        // Split the reduction to expose more workgroups and bound FP16 error.
         static const char * q6k_dense_dp4a_env = getenv("GGML_OPENCL_Q6K_DENSE_DP4A");
                      bool   q6k_dense_dp4a_on  = (q6k_dense_dp4a_env != nullptr)
                                                    ? (atoi(q6k_dense_dp4a_env) != 0)
                                                    : (backend_ctx->adreno_gen != ADRENO_GPU_GEN::X1E);
+        if (split_k_shape && q6k_dense_dp4a_env == nullptr) {
+            q6k_dense_dp4a_on = false;
+        }
         // dot prod has to be available
         q6k_dense_dp4a_on = backend_ctx->has_integer_dot && q6k_dense_dp4a_on;
 
@@ -18578,6 +18684,17 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
 
         // gemm
         kernel = backend_ctx->kernel_gemm_noshuffle_q6_K_f32;
+        if (split_k_shape) {
+            kernel = backend_ctx->kernel_gemm_noshuffle_q6_k_f32_split_k_4x8;
+        }
+        const int splits = split_k_shape ? backend_ctx->q6_k_splits : 1;
+        cl_mem result_buffer = extrad->data_device;
+        cl_ulong result_offset = offsetd;
+        if (splits > 1) {
+            backend_ctx->prealloc_k_quant_split.allocate(context, (size_t)ne01 * ne1 * splits * sizeof(float));
+            result_buffer = backend_ctx->prealloc_k_quant_split.buffer;
+            result_offset = 0;
+        }
         int padded_N = ne1 + padding;
 
         cl_ushort mask_f000 = 0xF000;
@@ -18588,8 +18705,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra0_q6_K->s));
         CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &extra0_q6_K->d));
         CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &b_img_trans));
-        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_mem),   &extrad->data_device));
-        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_mem),   &result_buffer));
+        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_ulong), &result_offset));
         CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
         CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &padded_N));
         CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne00));
@@ -18597,9 +18714,10 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ushort),&mask_f000));
         CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_uchar), &mask_c0));
 
-        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne1, 8), (size_t)CEIL_DIV(ne01, 4), 1};
-        size_t local_work_size[3] = {2, 128, 1};
+        size_t global_work_size[3] = {(size_t)CEIL_DIV(ne1, 8), (size_t)CEIL_DIV(ne01, 4), (size_t)splits};
+        size_t local_work_size[3] = {(size_t)(split_k_shape ? 1 : 2), (size_t)(split_k_shape ? 64 : 128), 1};
         backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+        if (splits > 1) ggml_cl_reduce_k_quant_split(backend_ctx, backend_ctx->kernel_reduce_q6_k_split_k, dst);
 
         CL_CHECK(clReleaseMemObject(b_sub_buf));
         CL_CHECK(clReleaseMemObject(b_img));
