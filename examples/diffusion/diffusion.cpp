@@ -207,6 +207,13 @@ static void diffusion_generate_sdar(llama_context *          ctx,
     }
 
     const std::vector<int32_t> num_transfer_tokens = get_num_transfer_tokens(params.block_length, params.steps);
+    const char * compact_env = getenv("LLAMA_SDAR_COMPACT_LOGITS");
+    const bool compact_logits = compact_env ? atoi(compact_env) != 0 :
+        (params.block_length == 32 || params.block_length == 64 || params.block_length == 128);
+    const char * commit_env = getenv("LLAMA_SDAR_COMMIT_NO_LOGITS");
+    const bool commit_no_logits = !commit_env || atoi(commit_env) != 0;
+    int32_t commit_forwards = 0;
+    int64_t output_rows = n_prefill;
 
     for (int32_t block = n_prefill; block < n_blocks; ++block) {
         const int32_t block_start = block * params.block_length;
@@ -231,7 +238,13 @@ static void diffusion_generate_sdar(llama_context *          ctx,
             }
 
             set_sdar_batch(batch, output_tokens, block_start, block_end, true);
+            if (compact_logits) {
+                for (int32_t i = 0; i < batch.n_tokens; ++i) {
+                    batch.logits[i] = output_tokens[block_start + i] == params.mask_token_id;
+                }
+            }
             const int ret = llama_decode(ctx, batch);
+            output_rows += compact_logits ? mask_positions.size() : batch.n_tokens;
             if (ret != 0) {
                 llama_memory_seq_rm(memory, 0, block_start, -1);
                 LOG_ERR("%s: failed to denoise block %d at step %d, ret = %d\n", __func__, block, step, ret);
@@ -256,7 +269,13 @@ static void diffusion_generate_sdar(llama_context *          ctx,
 
             for (size_t i = 0; i < mask_positions.size(); ++i) {
                 const int32_t local_pos  = mask_positions[i] - block_start;
-                float *       pos_logits = logits + local_pos * n_vocab;
+                float *       pos_logits = llama_get_logits_ith(ctx, local_pos);
+                if (!pos_logits) {
+                    llama_memory_seq_rm(memory, 0, block_start, -1);
+                    llama_batch_free(batch);
+                    llama_sampler_free(sampler);
+                    return;
+                }
                 if (params.add_gumbel_noise && params.temperature > 0.0f) {
                     add_gumbel_noise(pos_logits, n_vocab, params.temperature, rng);
                 }
@@ -325,12 +344,17 @@ static void diffusion_generate_sdar(llama_context *          ctx,
         }
 
         set_sdar_batch(batch, output_tokens, block_start, block_end, false);
+        if (commit_no_logits) {
+            std::fill(batch.logits, batch.logits + batch.n_tokens, 0);
+        }
         if (llama_decode(ctx, batch) != 0) {
             LOG_ERR("%s: failed to commit KV for block %d\n", __func__, block);
             llama_batch_free(batch);
             llama_sampler_free(sampler);
             return;
         }
+        ++commit_forwards;
+        output_rows += commit_no_logits ? 0 : 1;
 
         for (int32_t pos = std::max(block_start, n_input); pos < block_end; ++pos) {
             if (!params.ignore_eog && llama_vocab_is_eog(vocab, output_tokens[pos])) {
@@ -346,6 +370,8 @@ static void diffusion_generate_sdar(llama_context *          ctx,
     }
 
     const int64_t total_time = ggml_time_us() - time_start;
+    LOG_INF("SDAR work: prefill_forwards=%d denoising_forwards=%d commit_forwards=%d output_rows=%lld\n",
+            n_prefill, steps_done, commit_forwards, (long long)output_rows);
     LOG_INF("\nSDAR total time: %0.2fms, time per denoising step: %0.2fms, sampling time per step: %0.2fms\n",
             total_time / 1000.0, steps_done > 0 ? total_time / 1000.0 / steps_done : 0.0,
             steps_done > 0 ? sampling_time / 1000.0 / steps_done : 0.0);
