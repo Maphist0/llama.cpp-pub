@@ -10234,6 +10234,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int kv : {64, 128, 256, 512, 1024, 4096}) {
+        for (bool mask : {false, true}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 4, mask, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
+    for (int n : {4, 32, 64, 128}) {
+        for (int kv : {97, 513}) {
+            for (bool permuted : {false, true}) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, n,
+                    true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
+                    permuted ? std::array<int32_t, 4>{0, 2, 1, 3} : std::array<int32_t, 4>{0, 1, 2, 3}));
+            }
+        }
+    }
+
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
     for (int kv : { 1024, 2048, }) {

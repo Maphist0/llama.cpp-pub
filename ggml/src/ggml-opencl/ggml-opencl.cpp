@@ -795,6 +795,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_f16_f32_kq;
     cl_kernel kernel_mul_mm_f16_f32_kq_n4;
     cl_kernel kernel_mul_mm_f16_f32_kqv_n4;
+    cl_kernel kernel_flash_attn_sdar = nullptr;
+    cl_kernel kernel_flash_attn_sdar_q4 = nullptr;
     cl_kernel kernel_mul_mat_q4_0_f32, kernel_mul_mat_q4_0_f32_v;
     cl_kernel kernel_convert_block_q1_0, kernel_restore_block_q1_0;
     cl_kernel kernel_convert_block_q4_0, kernel_restore_block_q4_0;
@@ -7631,6 +7633,25 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_backend_opencl_cont
         && tensor->ne[2] == 1 && tensor->ne[3] == 1;
 }
 
+static bool ggml_cl_use_sdar_fa(ggml_backend_opencl_context * ctx, const ggml_tensor * op) {
+    const char * enabled = getenv("GGML_OPENCL_SDAR_FA");
+    if (!ctx->adreno_tuned_kernels || (enabled && atoi(enabled) == 0)) return false;
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+    const ggml_tensor * v = op->src[2];
+    const ggml_tensor * mask = op->src[3];
+    float params[3];
+    memcpy(params, op->op_params, sizeof(params));
+    return q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+        op->type == GGML_TYPE_F32 && q->ne[0] == 128 && k->ne[0] == 128 && v->ne[0] == 128 &&
+        q->ne[2] == 32 && k->ne[2] == 8 && v->ne[2] == 8 &&
+        q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 &&
+        q->nb[0] == 4 && k->nb[0] == 2 && v->nb[0] == 2 &&
+        k->ne[1] > 0 && k->ne[1] <= 4096 && v->ne[1] == k->ne[1] &&
+        params[1] == 0.0f && params[2] == 0.0f && !op->src[4] && ggml_is_contiguous(op) &&
+        (!mask || (mask->type == GGML_TYPE_F16 && mask->nb[0] == 2 && mask->ne[2] == 1 && mask->ne[3] == 1));
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -7950,6 +7971,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_MEAN:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT: {
+            if (ggml_cl_use_sdar_fa(backend_ctx, op)) return true;
             // The E17 compilers segfault while building FA kernels, skip E17 for now
             if (adreno_e17_compiler_quirks(backend_ctx)) {
                 return false;
@@ -15131,7 +15153,62 @@ static constexpr int FD_MAX_N_Q_MULTI = 8;
 static constexpr int FD_MQ_KV_PER_SPLIT = 256;
 static constexpr int FD_MQ_MAX_SPLITS   = 128;
 
+static void ggml_cl_flash_attn_sdar(ggml_backend_opencl_context * ctx, ggml_tensor * dst) {
+    if (!ctx->kernel_flash_attn_sdar) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string source {
+            #include "flash_attn_sdar_f32_f16.cl.h"
+        };
+#else
+        const std::string source = read_file("flash_attn_sdar_f32_f16.cl");
+#endif
+        cl_program program = build_program_from_source(ctx, source.c_str(), "-cl-std=CL2.0 -cl-mad-enable");
+        cl_int err;
+        ctx->kernel_flash_attn_sdar = clCreateKernel(program, "flash_attn_sdar_f32_f16", &err);
+        CL_CHECK(err);
+        ctx->kernel_flash_attn_sdar_q4 = clCreateKernel(program, "flash_attn_sdar_f32_f16_q4", &err);
+        CL_CHECK(err);
+        CL_CHECK(clReleaseProgram(program));
+    }
+    const char * tile_env = getenv("GGML_OPENCL_SDAR_FA_TILE");
+    const int tile = (!tile_env || atoi(tile_env) == 4) && dst->src[0]->ne[1] >= 32 &&
+        dst->src[0]->ne[1] % 4 == 0 && dst->src[1]->ne[1] <= 1024 ? 4 : 1;
+    cl_kernel kernel = tile == 4 ? ctx->kernel_flash_attn_sdar_q4 : ctx->kernel_flash_attn_sdar;
+    cl_uint arg = 0;
+    const ggml_tensor * tensors[] = {dst->src[0], dst->src[1], dst->src[2], dst->src[3], dst};
+    for (const ggml_tensor * tensor : tensors) {
+        const auto * extra = tensor ? (ggml_tensor_extra_cl *)tensor->extra : nullptr;
+        const cl_mem buffer = extra ? extra->data_device : nullptr;
+        const cl_ulong offset = extra ? extra->offset + tensor->view_offs : 0;
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(buffer), &buffer));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(offset), &offset));
+    }
+    for (int index = 0; index < 3; ++index) {
+        for (int dim = 1; dim <= 2; ++dim) {
+            const cl_ulong stride = tensors[index]->nb[dim];
+            CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(stride), &stride));
+        }
+    }
+    const cl_ulong mask_stride = tensors[3] ? tensors[3]->nb[1] : 0;
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(mask_stride), &mask_stride));
+    const int sizes[] = {(int)tensors[1]->ne[1], (int)tensors[0]->ne[2], (int)tensors[1]->ne[2]};
+    for (const int size : sizes) CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(size), &size));
+    float scale;
+    memcpy(&scale, dst->op_params, sizeof(scale));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(scale), &scale));
+    CL_CHECK(clSetKernelArg(kernel, arg++, tile * sizes[0] * sizeof(float), nullptr));
+    CL_CHECK(clSetKernelArg(kernel, arg++, tile * 64 * sizeof(float), nullptr));
+    size_t global[] = {64, (size_t)sizes[1], (size_t)tensors[0]->ne[1] / tile};
+    size_t local[] = {64, 1, 1};
+    ctx->enqueue_ndrange_kernel(kernel, 3, global, local, dst);
+}
+
 static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
+    auto * sdar_ctx = (ggml_backend_opencl_context *)backend->context;
+    if (ggml_cl_use_sdar_fa(sdar_ctx, dst)) {
+        ggml_cl_flash_attn_sdar(sdar_ctx, dst);
+        return;
+    }
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];

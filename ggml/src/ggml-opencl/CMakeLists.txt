@@ -226,6 +226,7 @@ set(GGML_OPENCL_KERNELS
     conv2d
     conv2d_f16_f32
     flash_attn_pre_f16
+    flash_attn_sdar_f32_f16
     flash_attn_f32_f16
     flash_attn_f32_q8_0
     flash_attn_f32_q4_0
