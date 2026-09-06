@@ -271,3 +271,37 @@ __kernel void mul_mm_f16_f32_kq(
     mm_store_c_N(matrix_C, regC0, regC1, subMatrixCStartInElements, line_stride_matrix_C_in_bytes, (N-block_id_n*32));
 }
 
+#ifdef KQV
+__kernel void mul_mm_f16_f32_kqv_n4(
+#else
+__kernel void mul_mm_f16_f32_kq_n4(
+#endif
+        __read_only image1d_buffer_t matrix_A, int offset0,
+        __global float * matrix_B, int offset1,
+        __write_only image1d_buffer_t matrix_C, int offsetd,
+        int M, int K, int N, int D_A, int D_B, int nb01) {
+    const int m = get_global_id(1) * 64 + get_local_id(0);
+    const int head = get_global_id(2);
+    const int kv_head = head / (D_B / D_A);
+#ifdef KQV
+    const int a_base = (kv_head * M + m) * (nb01 / 2);
+    const int b_base = head * K * N;
+    const int b_stride = K;
+#else
+    const int a_base = (m * D_A + kv_head) * K;
+    const int b_base = head * K;
+    const int b_stride = K * D_B;
+#endif
+    float sum[4] = {0, 0, 0, 0};
+    for (int ki = 0; ki < K; ki += 8) {
+        const float8 a = convert_float8(as_half8(read_imagef(matrix_A, (a_base + ki) / 8)));
+        #pragma unroll
+        for (int token = 0; token < 4; ++token) {
+            const float8 b = vload8(0, matrix_B + b_base + token * b_stride + ki);
+            sum[token] += dot(a.lo, b.lo) + dot(a.hi, b.hi);
+        }
+    }
+    for (int token = 0; token < 4; ++token) {
+        write_imagef(matrix_C, (head * 4 + token) * M + m, (float4)(sum[token], 0, 0, 0));
+    }
+}

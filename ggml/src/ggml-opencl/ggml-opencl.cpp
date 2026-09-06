@@ -793,6 +793,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_adreno_xmem_store_dst_f32;
     cl_kernel kernel_mul_mm_f16_f32_kqv;
     cl_kernel kernel_mul_mm_f16_f32_kq;
+    cl_kernel kernel_mul_mm_f16_f32_kq_n4;
+    cl_kernel kernel_mul_mm_f16_f32_kqv_n4;
     cl_kernel kernel_mul_mat_q4_0_f32, kernel_mul_mat_q4_0_f32_v;
     cl_kernel kernel_convert_block_q1_0, kernel_restore_block_q1_0;
     cl_kernel kernel_convert_block_q4_0, kernel_restore_block_q4_0;
@@ -2506,6 +2508,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_kqv = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_kqv, "mul_mm_f16_f32_kqv", &err), err));
         CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_kq = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_kq, "mul_mm_f16_f32_kq", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_kq_n4 = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_kq, "mul_mm_f16_f32_kq_n4", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_mm_f16_f32_kqv_n4 = clCreateKernel(backend_ctx->program_mul_mm_f16_f32_kqv, "mul_mm_f16_f32_kqv_n4", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -16362,6 +16366,13 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     kernel = is_kq ? backend_ctx->kernel_mul_mm_f16_f32_kq
                    : backend_ctx->kernel_mul_mm_f16_f32_kqv;
+    static const char * n4_env = getenv("GGML_OPENCL_SDAR_N4");
+    const bool use_n4 = backend_ctx->adreno_tuned_kernels && N == 4 &&
+        (n4_env == nullptr || n4_env[0] != '0');
+    if (use_n4) {
+        kernel = is_kq ? backend_ctx->kernel_mul_mm_f16_f32_kq_n4
+                       : backend_ctx->kernel_mul_mm_f16_f32_kqv_n4;
+    }
     // create sub-buffer for A
     // <--------------------------------------------> //
     extra0 = src0->view_src ? (ggml_tensor_extra_cl *)src0->view_src->extra : (ggml_tensor_extra_cl *)src0->extra;
@@ -16441,6 +16452,10 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
 
     size_t global_work_size[3] = {64, static_cast<size_t>(((M+63)/64)), static_cast<size_t>(((N+31)/32)*ne12)};
     size_t local_work_size[3] = {64, 1, 2};
+
+    if (use_n4) {
+        local_work_size[2] = 1;
+    }
 
     if (global_work_size[2] % local_work_size[2] != 0) {
         local_work_size[2] = 1;
@@ -19362,7 +19377,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         // Attention shapes in the graph satisfy both -- head sizes are multiples
         // of 64 and n_kv is padded -- which is why this has stayed latent.
         // Declining leaves the odd shapes on the generic GEMM, which handles them.
-        if (ne01 >= 64 && ne1 >= 32 && ne00 >= 16 &&
+        // The attention kernels mask short token tails. Admit SDAR's native
+        // four-token blocks instead of routing them through generic GEMM.
+        const bool sdar_native_attention = backend_ctx->adreno_tuned_kernels && ne1 == 4 &&
+            ne02 == 8 && ne12 == 32 && (ne00 == 128 || ne01 == 128);
+        if (ne01 >= 64 && (ne1 >= 32 || sdar_native_attention) && ne00 >= 16 &&
             (ne00 % 16) == 0 && (ne01 % 64) == 0 && (ne12 % ne02) == 0  &&
             // the KQ/KQV image kernels do not handle dim 3 (multi-stream batches)
             ne03 == 1 && ne13 == 1 &&
