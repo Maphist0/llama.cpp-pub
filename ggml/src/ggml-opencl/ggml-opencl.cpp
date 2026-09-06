@@ -16384,6 +16384,10 @@ static void ggml_cl_mul_mat_kq_kqv_adreno(ggml_backend_t backend, const ggml_ten
     size_t global_work_size[3] = {64, static_cast<size_t>(((M+63)/64)), static_cast<size_t>(((N+31)/32)*ne12)};
     size_t local_work_size[3] = {64, 1, 2};
 
+    if (global_work_size[2] % local_work_size[2] != 0) {
+        local_work_size[2] = 1;
+    }
+
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 
     // deallocate sub buffers and images
@@ -19291,7 +19295,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // For KQV. Reaching this arm is what makes the op a KQV; the callee
             // is told so explicitly rather than re-deriving it from the strides
             // the arm above has already ruled on.
-            if (!ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+            // V can have padded rows or be contiguous when the cache is full.
+            const bool kqv_packed_a = nb00 == ggml_type_size(src0t) &&
+                                      nb01 >= (cl_ulong) ne00 * ggml_type_size(src0t) &&
+                                      nb01 % 16 == 0 && nb02 == nb01 * ne01;
+            if (kqv_packed_a && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
                 ((nb02 * ne02 / 4)/4 <= backend_ctx->image_max_buffer_size)) {
                 ggml_cl_mul_mat_kq_kqv_adreno(backend, src0, src1, dst, /*is_kq =*/ false);
                 return;

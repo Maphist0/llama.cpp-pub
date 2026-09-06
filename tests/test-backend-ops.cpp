@@ -4688,6 +4688,29 @@ struct test_mul_mat : public test_case {
     }
 };
 
+struct test_mul_mat_kqv : public test_mul_mat {
+    test_mul_mat_kqv(int64_t m, int64_t n, int64_t k, int64_t heads = 8, int64_t repeats = 4, int64_t k_v = 0, int64_t streams = 1)
+        : test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, n, k, {heads, streams}, {repeats, 1}, {0, 1, 2, 3}, k_v) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",kqv=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, type_a, k_v == 0 ? k : k_v, m, bs[0], bs[1]);
+        if (k_v != 0) {
+            GGML_ASSERT(k_v > k);
+            a = ggml_view_4d(ctx, a, k, m, bs[0], bs[1], a->nb[1], a->nb[2], a->nb[3], 0);
+        }
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, type_b, k, n, bs[0] * nr[0], bs[1]);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -9570,6 +9593,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 #endif
+
+    // Value attention with contiguous probabilities and full or partially filled caches.
+    for (int64_t n : {4, 32, 64, 128}) {
+        for (int64_t k : {256, 512}) {
+            test_cases.emplace_back(new test_mul_mat_kqv(128, n, k));
+            test_cases.emplace_back(new test_mul_mat_kqv(128, n, k, 8, 4, 1024));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_kqv(64, 32, 80, 1, 1));
+    test_cases.emplace_back(new test_mul_mat_kqv(128, 45, 256, 3, 1));
+    test_cases.emplace_back(new test_mul_mat_kqv(128, 65, 256, 3, 1));
+    test_cases.emplace_back(new test_mul_mat_kqv(96, 32, 256));
+    test_cases.emplace_back(new test_mul_mat_kqv(128, 32, 250));
+    test_cases.emplace_back(new test_mul_mat_kqv(128, 32, 256, 8, 4, 0, 2));
+    for (int64_t n : {4, 32, 45, 65}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, n, 128, {8, 1}, {4, 1}, {0, 2, 1, 3}));
+    }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 2,  128, { 8,  1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  83, 2,  128, { 8,  1}, {4, 1}));

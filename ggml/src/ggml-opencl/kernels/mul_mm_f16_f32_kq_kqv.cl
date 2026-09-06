@@ -206,8 +206,8 @@ __kernel void mul_mm_f16_f32_kq(
 
     __private float16  regA;
     __private float8   regB;
-    __private float16 regC0;
-    __private float16 regC1;
+    __private float16 regC0 = 0;
+    __private float16 regC1 = 0;
 
     const uint col   = block_id_m * TILESIZE_M;
     const uint row   = block_id_n * TILESIZE_N;
@@ -258,8 +258,8 @@ __kernel void mul_mm_f16_f32_kq(
         uint b_coordInWords00 = subMatrixBStartInElements + b_globalOffsetInWords00;
         uint b_coordInWords16 = subMatrixBStartInElements + b_globalOffsetInWords16;
 
-        regB.s0123 = vload4(b_coordInWords00/4, matrix_B);
-        regB.s4567 = vload4(b_coordInWords16/4, matrix_B);
+        regB.s0123 = row + b_globalOffsetInWords_xy.y < N ? vload4(b_coordInWords00/4, matrix_B) : (float4) 0;
+        regB.s4567 = row + b_globalOffsetInWords_xy.y + 16 < N ? vload4(b_coordInWords16/4, matrix_B) : (float4) 0;
 
         mm_mad(matrix_B_local, regA, regB, b_localOffsetInWords, &regC0, &regC1);
 
