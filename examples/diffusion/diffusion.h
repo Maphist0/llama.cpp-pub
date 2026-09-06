@@ -45,6 +45,7 @@ struct diffusion_params {
     int32_t block_length     = 0;      // Block size (for block scheduling)
     float   alg_temp         = 0;      // algorithm temperature (0.0 = deterministic)
     bool    add_gumbel_noise = false;  // Add gumbel noise to the logits if temp > 0.0
+    bool    ignore_eog       = false;  // Continue SDAR generation through end-of-generation tokens
 
     int32_t max_length = 0;            // Maximum sequence length
 };

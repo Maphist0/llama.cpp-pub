@@ -140,7 +140,13 @@ static void diffusion_generate_sdar(llama_context *          ctx,
         return;
     }
 
-    const int32_t total_length = params.max_length / params.block_length * params.block_length;
+    if (params.max_length % params.block_length != 0) {
+        LOG_ERR("%s: max length (%d) must be divisible by SDAR block length (%d)\n",
+                __func__, params.max_length, params.block_length);
+        return;
+    }
+
+    const int32_t total_length = params.max_length;
     if (total_length <= n_input) {
         LOG_ERR("%s: max length must leave room for at least one SDAR block\n", __func__);
         return;
@@ -327,7 +333,7 @@ static void diffusion_generate_sdar(llama_context *          ctx,
         }
 
         for (int32_t pos = std::max(block_start, n_input); pos < block_end; ++pos) {
-            if (llama_vocab_is_eog(vocab, output_tokens[pos])) {
+            if (!params.ignore_eog && llama_vocab_is_eog(vocab, output_tokens[pos])) {
                 n_generated = pos + 1;
                 block       = n_blocks;
                 break;

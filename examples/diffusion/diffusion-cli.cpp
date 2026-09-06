@@ -174,8 +174,7 @@ int main(int argc, char ** argv) {
 
     bool visual_mode = params.diffusion.visual_mode;
 
-    int32_t                  n_generated = 0;
-    std::vector<llama_token> output_tokens(params.n_ubatch);
+    int32_t n_generated = 0;
 
     struct diffusion_params diff_params;
 
@@ -209,11 +208,43 @@ int main(int argc, char ** argv) {
     diff_params.temperature      = params.sampling.temp;
     diff_params.steps            = params.diffusion.steps;
     diff_params.algorithm        = static_cast<diffusion_algorithm>(params.diffusion.algorithm);
-    diff_params.max_length       = params.n_ubatch;
     diff_params.top_p            = params.sampling.top_p;
     diff_params.top_k            = params.sampling.top_k;
     diff_params.visual_mode      = params.diffusion.visual_mode;
     diff_params.add_gumbel_noise = params.diffusion.add_gumbel_noise;
+    diff_params.ignore_eog       = params.sampling.ignore_eos;
+
+    int64_t requested_max_length = params.n_ubatch;
+    if (params.n_predict >= 0) {
+        if (params.n_predict == 0) {
+            LOG_ERR("error: --predict must be positive for diffusion generation\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            return 1;
+        }
+        requested_max_length = static_cast<int64_t>(n_input) + params.n_predict;
+    }
+    if (requested_max_length > llama_n_ctx(ctx) || requested_max_length > INT32_MAX) {
+        LOG_ERR("error: requested sequence length (%lld) exceeds context capacity (%u)\n",
+                (long long) requested_max_length, llama_n_ctx(ctx));
+        llama_free(ctx);
+        llama_model_free(model);
+        llama_backend_free();
+        return 1;
+    }
+    if (diff_params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED &&
+        requested_max_length % diff_params.block_length != 0) {
+        LOG_ERR("error: input tokens (%d) plus requested output tokens (%d) must be divisible by block length (%d)\n",
+                n_input, params.n_predict, diff_params.block_length);
+        llama_free(ctx);
+        llama_model_free(model);
+        llama_backend_free();
+        return 1;
+    }
+    diff_params.max_length = static_cast<int32_t>(requested_max_length);
+
+    std::vector<llama_token> output_tokens(diff_params.max_length);
 
     diff_params.step_callback           = diffusion_step_callback;
     callback_data cb_data               = { &diff_params, vocab, n_input };
@@ -238,6 +269,8 @@ int main(int argc, char ** argv) {
     LOG_INF("diffusion_params: - %-25s llama_token      = %d\n", "mask_token_id", mask_token_id);
     LOG_INF("diffusion_params: - %-25s u32              = %d\n", "steps", diff_params.steps);
     LOG_INF("diffusion_params: - %-25s u32              = %d\n", "max_length", diff_params.max_length);
+    LOG_INF("diffusion_params: - %-25s u32              = %d\n", "new_tokens", diff_params.max_length - n_input);
+    LOG_INF("diffusion_params: - %-25s bool             = %s\n", "ignore_eog", diff_params.ignore_eog ? "true" : "false");
     LOG_INF("diffusion_params: - %-25s enum             = %d (%s)\n", "algorithm", diff_params.algorithm, alg_name);
     LOG_INF("diffusion_params: - %-25s enum             = %d (%s)\n", "schedule", diff_params.schedule, sched_name);
     LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "temperature", diff_params.temperature);
@@ -253,6 +286,15 @@ int main(int argc, char ** argv) {
     diffusion_generate(ctx, input_tokens.data(), output_tokens.data(), n_input, diff_params, n_generated);
 
     const bool generation_succeeded = n_generated > n_input;
+    if (generation_succeeded && params.n_predict >= 0 && params.sampling.ignore_eos &&
+        n_generated != diff_params.max_length) {
+        LOG_ERR("error: exact-length generation requested %d new tokens but produced %d\n",
+                params.n_predict, n_generated - n_input);
+        llama_free(ctx);
+        llama_model_free(model);
+        llama_backend_free();
+        return 1;
+    }
     if (generation_succeeded) {
         if (visual_mode) {
             //clear screen and move cursor to top-left
@@ -261,6 +303,8 @@ int main(int argc, char ** argv) {
 
         output_tokens.resize(n_generated);
         output_tokens.erase(output_tokens.begin(), output_tokens.begin() + n_input);
+        LOG_INF("diffusion_result: input_tokens=%d output_tokens=%zu total_tokens=%d\n",
+                n_input, output_tokens.size(), n_generated);
         std::string output_data = common_detokenize(vocab, output_tokens, false);
         LOG_INF("\n%s\n", output_data.c_str());
     } else {
