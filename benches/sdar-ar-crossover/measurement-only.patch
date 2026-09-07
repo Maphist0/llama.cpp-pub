@@ -1,0 +1,77 @@
+--- a/tools/completion/completion.cpp
++++ b/tools/completion/completion.cpp
+@@ -140,6 +140,7 @@
+     // load the model and apply lora adapter, if any
+     LOG_INF("%s: load the model and apply lora adapter, if any\n", __func__);
+ 
++    params.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL;
+     auto llama_init = common_init_from_params(params);
+ 
+     ctx   = llama_init->context();
+@@ -542,6 +543,14 @@
+         embd_inp.push_back(decoder_start_token_id);
+     }
+ 
++    std::string benchmark_prompt_ids;
++    for (auto token : embd_inp) { benchmark_prompt_ids += std::to_string(token) + ","; }
++    LOG_INF("benchmark_prompt_ids: %s\n", benchmark_prompt_ids.c_str());
++    int benchmark_generated = 0;
++    int64_t benchmark_first_token_us = 0;
++    llama_synchronize(ctx);
++    const int64_t benchmark_start_us = ggml_time_us();
++
+     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
+         // predict
+         if (!embd.empty()) {
+@@ -666,6 +675,9 @@
+         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
+ 
+             const llama_token id = common_sampler_sample(smpl, ctx, -1);
++            if (benchmark_generated++ == 0) {
++                benchmark_first_token_us = ggml_time_us() - benchmark_start_us;
++            }
+ 
+             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
+ 
+@@ -939,6 +951,10 @@
+         }
+     }
+ 
++    llama_synchronize(ctx);
++    const int64_t benchmark_elapsed_us = ggml_time_us() - benchmark_start_us;
++    LOG_INF("\nbenchmark_result: input_tokens=%zu output_tokens=%d elapsed_us=%lld first_token_us=%lld causal=1\n", embd_inp.size(), benchmark_generated, (long long) benchmark_elapsed_us, (long long) benchmark_first_token_us);
++
+     if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
+         LOG("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
+         session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
+--- a/examples/diffusion/diffusion-cli.cpp
++++ b/examples/diffusion/diffusion-cli.cpp
+@@ -158,6 +158,10 @@
+                                                             formatted_prompt,
+                                                             /*add special tokens*/ true,
+                                                             /*parse special*/ true);
++
++    std::string benchmark_prompt_ids;
++    for (auto token : input_tokens) { benchmark_prompt_ids += std::to_string(token) + ","; }
++    LOG_INF("benchmark_prompt_ids: %s\n", benchmark_prompt_ids.c_str());
+ 
+     int n_input = input_tokens.size();
+ 
+--- a/examples/diffusion/diffusion.cpp
++++ b/examples/diffusion/diffusion.cpp
+@@ -192,6 +192,7 @@
+     const int32_t callback_steps = n_decode * params.steps;
+     int32_t       steps_done     = 0;
+     int64_t       sampling_time  = 0;
++    llama_synchronize(ctx);
+     const int64_t time_start     = ggml_time_us();
+ 
+     for (int32_t block = 0; block < n_prefill; ++block) {
+@@ -369,6 +370,7 @@
+         n_generated = total_length;
+     }
+ 
++    llama_synchronize(ctx);
+     const int64_t total_time = ggml_time_us() - time_start;
+     LOG_INF("SDAR work: prefill_forwards=%d denoising_forwards=%d commit_forwards=%d output_rows=%lld\n",
+             n_prefill, steps_done, commit_forwards, (long long)output_rows);
