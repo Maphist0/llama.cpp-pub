@@ -213,6 +213,7 @@ int main(int argc, char ** argv) {
     diff_params.visual_mode      = params.diffusion.visual_mode;
     diff_params.add_gumbel_noise = params.diffusion.add_gumbel_noise;
     diff_params.ignore_eog       = params.sampling.ignore_eos;
+    diff_params.confidence_threshold = params.diffusion.confidence_threshold;
 
     int64_t requested_max_length = params.n_ubatch;
     if (params.n_predict >= 0) {
@@ -256,13 +257,14 @@ int main(int argc, char ** argv) {
         "DIFFUSION_ALGORITHM_MARGIN_BASED",
         "DIFFUSION_ALGORITHM_RANDOM",
         "DIFFUSION_ALGORITHM_CONFIDENCE_BASED",
+        "DIFFUSION_ALGORITHM_CONFIDENCE_DYNAMIC",
     };
     const char * sched_names[] = {
         "DIFFUSION_TRANSFER_SCHEDULE_TIMESTEP_BASED",
         "DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED",
     };
     const char * alg_name =
-        (diff_params.algorithm >= 0 && diff_params.algorithm <= 4) ? alg_names[diff_params.algorithm] : "UNKNOWN";
+        (diff_params.algorithm >= 0 && diff_params.algorithm <= 5) ? alg_names[diff_params.algorithm] : "UNKNOWN";
     const char * sched_name =
         (diff_params.schedule >= 0 && diff_params.schedule <= 1) ? sched_names[diff_params.schedule] : "UNKNOWN";
 
@@ -281,6 +283,9 @@ int main(int argc, char ** argv) {
     if (diff_params.schedule == DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED) {
         LOG_INF("diffusion_params: - %-25s u32              = %d\n", "block_length", diff_params.block_length);
         LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "cfg_scale", diff_params.cfg_scale);
+        if (diff_params.algorithm == DIFFUSION_ALGORITHM_CONFIDENCE_DYNAMIC) {
+            LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "confidence_threshold", diff_params.confidence_threshold);
+        }
     }
 
     diffusion_generate(ctx, input_tokens.data(), output_tokens.data(), n_input, diff_params, n_generated);

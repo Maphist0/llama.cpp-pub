@@ -4473,7 +4473,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format(
             "diffusion algorithm: 0=DIFFUSION_ALGORITHM_ORIGIN, 1=DIFFUSION_ALGORITHM_ENTROPY_BASED, "
             "2=DIFFUSION_ALGORITHM_MARGIN_BASED, 3=DIFFUSION_ALGORITHM_RANDOM, "
-            "4=DIFFUSION_ALGORITHM_CONFIDENCE_BASED (default: %d)", params.diffusion.algorithm),
+            "4=DIFFUSION_ALGORITHM_CONFIDENCE_BASED, "
+            "5=DIFFUSION_ALGORITHM_CONFIDENCE_DYNAMIC (block diffusion only) (default: %d)", params.diffusion.algorithm),
         [](common_params & params, int value) { params.diffusion.algorithm = value; }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
@@ -4485,6 +4486,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--diffusion-block-length"}, "N",
         string_format("llada block length for generation (default: %d)", params.diffusion.block_length),
         [](common_params & params, int value) { params.diffusion.block_length = value; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-confidence-threshold"}, "F",
+        string_format("token acceptance threshold for dynamic confidence (algorithm 5) (default: %.2f)", (double) params.diffusion.confidence_threshold),
+        [](common_params & params, const std::string & value) {
+            const float threshold = std::stof(value);
+            if (!std::isfinite(threshold) || threshold < 0.0f || threshold > 1.0f) {
+                throw std::invalid_argument("diffusion confidence threshold must be between 0 and 1");
+            }
+            params.diffusion.confidence_threshold = threshold;
+        }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
         {"--diffusion-cfg-scale"}, "F",

@@ -17,6 +17,18 @@ static float calculate_confidence(const llama_token_data_array & cur_p,
         case DIFFUSION_ALGORITHM_CONFIDENCE_BASED:
             return cur_p.data[cur_p.selected].p;  // Selected token probability
 
+        case DIFFUSION_ALGORITHM_CONFIDENCE_DYNAMIC:
+            {
+                // Normalize after filtering, including when greedy sampling does not populate p.
+                const float max_logit = std::max_element(cur_p.data, cur_p.data + cur_p.size,
+                    [](const llama_token_data & a, const llama_token_data & b) { return a.logit < b.logit; })->logit;
+                double sum = 0.0;
+                for (size_t i = 0; i < cur_p.size; ++i) {
+                    sum += std::exp(cur_p.data[i].logit - max_logit);
+                }
+                return std::exp(cur_p.data[cur_p.selected].logit - max_logit) / sum;
+            }
+
         case DIFFUSION_ALGORITHM_ENTROPY_BASED:
             {
                 float       entropy = 0.0f;
@@ -141,8 +153,14 @@ static void diffusion_generate_block(llama_context *          ctx,
         LOG_ERR("%s: classifier-free guidance is not supported for block diffusion\n", __func__);
         return;
     }
-    if (params.algorithm != DIFFUSION_ALGORITHM_CONFIDENCE_BASED) {
+    const bool dynamic_confidence = params.algorithm == DIFFUSION_ALGORITHM_CONFIDENCE_DYNAMIC;
+    if (params.algorithm != DIFFUSION_ALGORITHM_CONFIDENCE_BASED && !dynamic_confidence) {
         LOG_ERR("%s: block diffusion currently supports only confidence-based remasking\n", __func__);
+        return;
+    }
+    if (dynamic_confidence && (params.add_gumbel_noise || !std::isfinite(params.confidence_threshold) ||
+        params.confidence_threshold < 0.0f || params.confidence_threshold > 1.0f)) {
+        LOG_ERR("%s: dynamic confidence requires no Gumbel noise and a confidence threshold in [0, 1]\n", __func__);
         return;
     }
     if ((uint32_t) params.block_length > llama_n_batch(ctx) || (uint32_t) params.block_length > llama_n_ubatch(ctx)) {
@@ -183,15 +201,21 @@ static void diffusion_generate_block(llama_context *          ctx,
     mask_positions.reserve(params.block_length);
 
     llama_sampler * sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    if (params.temperature > 0.0f) {
+    if (dynamic_confidence || params.temperature > 0.0f) {
+        if (dynamic_confidence && params.temperature > 0.0f) {
+            llama_sampler_chain_add(sampler, llama_sampler_init_temp(params.temperature));
+        }
         if (params.top_k > 0) {
             llama_sampler_chain_add(sampler, llama_sampler_init_top_k(params.top_k));
         }
         if (params.top_p < 1.0f) {
             llama_sampler_chain_add(sampler, llama_sampler_init_top_p(params.top_p, 1));
         }
-        llama_sampler_chain_add(sampler, llama_sampler_init_temp(params.temperature));
-        llama_sampler_chain_add(sampler, llama_sampler_init_dist(params.seed));
+        if (!dynamic_confidence) {
+            llama_sampler_chain_add(sampler, llama_sampler_init_temp(params.temperature));
+        }
+        llama_sampler_chain_add(sampler, params.temperature > 0.0f ?
+            llama_sampler_init_dist(params.seed) : llama_sampler_init_greedy());
     }
 
     llama_batch batch = llama_batch_init(params.block_length, 0, 1);
@@ -296,7 +320,7 @@ static void diffusion_generate_block(llama_context *          ctx,
                     candidates[token_id].p     = 0.0f;
                 }
 
-                if (params.temperature > 0.0f) {
+                if (dynamic_confidence || params.temperature > 0.0f) {
                     llama_token_data_array cur_p = {
                         candidates.data(),
                         candidates.size(),
@@ -320,7 +344,13 @@ static void diffusion_generate_block(llama_context *          ctx,
                 }
             }
 
-            const int32_t transfer_count = std::min<int32_t>(num_transfer_tokens[step], mask_positions.size());
+            int32_t transfer_count = std::min<int32_t>(num_transfer_tokens[step], mask_positions.size());
+            if (dynamic_confidence) {
+                const int32_t high_confidence = std::count_if(confidences.begin(), confidences.end(),
+                    [&](const std::pair<float, int32_t> & candidate) { return candidate.first > params.confidence_threshold; });
+                transfer_count = step == params.steps - 1 ? mask_positions.size() :
+                    std::min<int32_t>(mask_positions.size(), std::max({ 1, transfer_count, high_confidence }));
+            }
             std::partial_sort(confidences.begin(), confidences.begin() + transfer_count, confidences.end(),
                               [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
                                   if (a.first != b.first) {
@@ -405,6 +435,10 @@ void diffusion_generate(llama_context *          ctx,
 
     if (model_uses_block_diffusion(model)) {
         diffusion_generate_block(ctx, input_tokens, output_tokens, n_input, params, n_generated);
+        return;
+    }
+    if (params.algorithm == DIFFUSION_ALGORITHM_CONFIDENCE_DYNAMIC) {
+        LOG_ERR("%s: dynamic confidence requires a block diffusion model\n", __func__);
         return;
     }
 

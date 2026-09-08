@@ -10,6 +10,7 @@ enum diffusion_algorithm {
     DIFFUSION_ALGORITHM_MARGIN_BASED     = 2,
     DIFFUSION_ALGORITHM_RANDOM           = 3,
     DIFFUSION_ALGORITHM_CONFIDENCE_BASED = 4,
+    DIFFUSION_ALGORITHM_CONFIDENCE_DYNAMIC = 5,
 };
 
 // Unified transfer scheduling methods
@@ -44,6 +45,7 @@ struct diffusion_params {
     float   eps              = 0.;     // Timestep scheduling
     int32_t block_length     = 0;      // Block size (for block scheduling)
     float   alg_temp         = 0;      // algorithm temperature (0.0 = deterministic)
+    float   confidence_threshold = 0.9f; // Dynamic confidence acceptance
     bool    add_gumbel_noise = false;  // Add gumbel noise to the logits if temp > 0.0
     bool    ignore_eog       = false;  // Continue SDAR generation through end-of-generation tokens
 
