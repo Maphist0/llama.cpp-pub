@@ -1569,6 +1569,9 @@ class GGUFWriter:
 
     # diffusion models
 
+    def add_diffusion_mode(self, value: str) -> None:
+        self.add_string(Keys.Diffusion.MODE, value)
+
     def add_diffusion_shift_logits(self, value: bool) -> None:
         self.add_bool(Keys.Diffusion.SHIFT_LOGITS, value)
 

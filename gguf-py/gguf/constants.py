@@ -455,6 +455,7 @@ class Keys:
             LAYERNORM_EPS   = "clip.gen.audio.attention.layer_norm_epsilon"
 
     class Diffusion:
+        MODE                = "diffusion.mode"
         SHIFT_LOGITS        = "diffusion.shift_logits"
 
     class xIELU:

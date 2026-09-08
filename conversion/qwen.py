@@ -262,6 +262,7 @@ class SDARModel(Qwen3Model):
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
+        self.gguf_writer.add_diffusion_mode("block")
         self.gguf_writer.add_causal_attention(False)
         self.gguf_writer.add_diffusion_shift_logits(False)
 

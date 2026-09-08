@@ -100,13 +100,19 @@ static std::vector<int32_t> get_num_transfer_tokens(int32_t mask_count, int32_t 
     return num_transfer_tokens;
 }
 
-static bool model_is_sdar(const llama_model * model) {
+static bool model_uses_block_diffusion(const llama_model * model) {
+    char mode[16] = {};
+    if (llama_model_meta_val_str(model, "diffusion.mode", mode, sizeof(mode)) >= 0) {
+        return strcmp(mode, "block") == 0;
+    }
+
+    // Older SDAR files do not declare a diffusion mode.
     char architecture[16] = {};
     return llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) >= 0 &&
            strcmp(architecture, "sdar") == 0;
 }
 
-static void set_sdar_batch(llama_batch &       batch,
+static void set_block_batch(llama_batch &       batch,
                            const llama_token * tokens,
                            int32_t             block_start,
                            int32_t             block_end,
@@ -121,34 +127,38 @@ static void set_sdar_batch(llama_batch &       batch,
     }
 }
 
-static void diffusion_generate_sdar(llama_context *          ctx,
+static void diffusion_generate_block(llama_context *          ctx,
                                     const llama_token *      input_tokens,
                                     llama_token *            output_tokens,
                                     int32_t                  n_input,
                                     const diffusion_params & params,
                                     int32_t &                n_generated) {
     if (params.schedule != DIFFUSION_TRANSFER_SCHEDULE_BLOCK_BASED || params.block_length <= 0 || params.steps <= 0) {
-        LOG_ERR("%s: SDAR requires a positive block length and denoising step count\n", __func__);
+        LOG_ERR("%s: block diffusion requires a positive block length and denoising step count\n", __func__);
         return;
     }
     if (params.cfg_scale != 0.0f) {
-        LOG_ERR("%s: classifier-free guidance is not supported for SDAR\n", __func__);
+        LOG_ERR("%s: classifier-free guidance is not supported for block diffusion\n", __func__);
         return;
     }
     if (params.algorithm != DIFFUSION_ALGORITHM_CONFIDENCE_BASED) {
-        LOG_ERR("%s: SDAR currently supports only confidence-based remasking\n", __func__);
+        LOG_ERR("%s: block diffusion currently supports only confidence-based remasking\n", __func__);
+        return;
+    }
+    if ((uint32_t) params.block_length > llama_n_batch(ctx) || (uint32_t) params.block_length > llama_n_ubatch(ctx)) {
+        LOG_ERR("%s: batch and ubatch sizes must fit a complete diffusion block\n", __func__);
         return;
     }
 
     if (params.max_length % params.block_length != 0) {
-        LOG_ERR("%s: max length (%d) must be divisible by SDAR block length (%d)\n",
+        LOG_ERR("%s: max length (%d) must be divisible by block length (%d)\n",
                 __func__, params.max_length, params.block_length);
         return;
     }
 
     const int32_t total_length = params.max_length;
     if (total_length <= n_input) {
-        LOG_ERR("%s: max length must leave room for at least one SDAR block\n", __func__);
+        LOG_ERR("%s: max length must leave room for generation\n", __func__);
         return;
     }
 
@@ -157,7 +167,7 @@ static void diffusion_generate_sdar(llama_context *          ctx,
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
     llama_memory_t      memory  = llama_get_memory(ctx);
     if (!memory) {
-        LOG_ERR("%s: SDAR requires a KV cache\n", __func__);
+        LOG_ERR("%s: block diffusion requires a KV cache\n", __func__);
         return;
     }
 
@@ -197,7 +207,7 @@ static void diffusion_generate_sdar(llama_context *          ctx,
     for (int32_t block = 0; block < n_prefill; ++block) {
         const int32_t block_start = block * params.block_length;
         const int32_t block_end   = block_start + params.block_length;
-        set_sdar_batch(batch, output_tokens, block_start, block_end, false);
+        set_block_batch(batch, output_tokens, block_start, block_end, false);
         if (llama_decode(ctx, batch) != 0) {
             LOG_ERR("%s: failed to prefill block %d\n", __func__, block);
             llama_batch_free(batch);
@@ -237,7 +247,7 @@ static void diffusion_generate_sdar(llama_context *          ctx,
                 return;
             }
 
-            set_sdar_batch(batch, output_tokens, block_start, block_end, true);
+            set_block_batch(batch, output_tokens, block_start, block_end, true);
             if (compact_logits) {
                 for (int32_t i = 0; i < batch.n_tokens; ++i) {
                     batch.logits[i] = output_tokens[block_start + i] == params.mask_token_id;
@@ -343,7 +353,7 @@ static void diffusion_generate_sdar(llama_context *          ctx,
             }
         }
 
-        set_sdar_batch(batch, output_tokens, block_start, block_end, false);
+        set_block_batch(batch, output_tokens, block_start, block_end, false);
         if (commit_no_logits) {
             std::fill(batch.logits, batch.logits + batch.n_tokens, 0);
         }
@@ -393,8 +403,8 @@ void diffusion_generate(llama_context *          ctx,
 
     const llama_model * model = llama_get_model(ctx);
 
-    if (model_is_sdar(model)) {
-        diffusion_generate_sdar(ctx, input_tokens, output_tokens, n_input, params, n_generated);
+    if (model_uses_block_diffusion(model)) {
+        diffusion_generate_block(ctx, input_tokens, output_tokens, n_input, params, n_generated);
         return;
     }
 

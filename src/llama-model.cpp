@@ -1210,6 +1210,13 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         gguf_kv.emplace(name, value);
     }
 
+    const int64_t diffusion_mode_key = gguf_find_key(ctx, "diffusion.mode");
+    if (diffusion_mode_key >= 0 &&
+        (gguf_get_kv_type(ctx, diffusion_mode_key) != GGUF_TYPE_STRING ||
+         strcmp(gguf_get_val_str(ctx, diffusion_mode_key), "block") != 0)) {
+        throw std::runtime_error("unsupported diffusion.mode: expected the string 'block'");
+    }
+
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
 
@@ -3123,7 +3130,9 @@ bool llama_model_is_hybrid(const llama_model * model) {
 }
 
 bool llama_model_is_diffusion(const llama_model * model) {
-    return llm_arch_is_diffusion(model->arch);
+    const auto mode = model->gguf_kv.find("diffusion.mode");
+    return llm_arch_is_diffusion(model->arch) ||
+           (mode != model->gguf_kv.end() && mode->second == "block");
 }
 
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {
