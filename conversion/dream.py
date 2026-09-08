@@ -6,6 +6,7 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 from .base import ModelBase, TextModel, gguf
+from .qwen import Qwen3Model
 
 
 @ModelBase.register("DreamModel")
@@ -71,3 +72,24 @@ class DreamModel(TextModel):
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # Dream model tensors should be mapped directly since it's the base model
         yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("DreamForCausalLM")
+@ModelBase.example("Dream-org/DreamReasoner-8B")
+@ModelBase.example("Dream-org/DreamReasoner-8B-Base")
+class DreamReasonerModel(Qwen3Model):
+    model_arch = gguf.MODEL_ARCH.QWEN3
+
+    def get_vocab_base(self) -> tuple[list[str], list[int], str]:
+        return DreamModel.get_vocab_base(self)  # ty: ignore[invalid-argument-type]
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_diffusion_mode("block")
+        self.gguf_writer.add_causal_attention(False)
+        self.gguf_writer.add_diffusion_shift_logits(False)
+
+        mask_token_id = self.hparams.get("mask_token_id")
+        if mask_token_id is None or not 0 <= mask_token_id < self.hparams["vocab_size"]:
+            raise ValueError("DreamReasoner requires a valid mask_token_id in config.json")
+        self.gguf_writer.add_mask_token_id(mask_token_id)
