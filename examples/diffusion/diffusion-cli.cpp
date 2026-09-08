@@ -214,6 +214,7 @@ int main(int argc, char ** argv) {
     diff_params.add_gumbel_noise = params.diffusion.add_gumbel_noise;
     diff_params.ignore_eog       = params.sampling.ignore_eos;
     diff_params.confidence_threshold = params.diffusion.confidence_threshold;
+    diff_params.cfg_scale        = params.diffusion.cfg_scale;
 
     int64_t requested_max_length = params.n_ubatch;
     if (params.n_predict >= 0) {
