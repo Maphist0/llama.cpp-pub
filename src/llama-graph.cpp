@@ -130,13 +130,13 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
 
         if (ubatch->token && n_pos_per_embd == 4) {
             // in case we're using M-RoPE with text tokens, convert the 1D positions to 4D
-            // the 3 first dims are the same, and 4th dim is all 0
+            // Qwen uses the same first three axes; U1 leaves text spatial axes at zero.
             std::vector<llama_pos> pos_data(n_tokens*n_pos_per_embd);
             // copy the first dimension
             for (int i = 0; i < n_tokens; ++i) {
                 pos_data[               i] = ubatch->pos[i];
-                pos_data[    n_tokens + i] = ubatch->pos[i];
-                pos_data[2 * n_tokens + i] = ubatch->pos[i];
+                pos_data[    n_tokens + i] = broadcast_text ? ubatch->pos[i] : 0;
+                pos_data[2 * n_tokens + i] = broadcast_text ? ubatch->pos[i] : 0;
                 pos_data[3 * n_tokens + i] = 0; // 4th dim is 0
             }
             ggml_backend_tensor_set(pos, pos_data.data(), 0, pos_data.size()*ggml_element_size(pos));
@@ -2444,8 +2444,8 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     return cur;
 }
 
-ggml_tensor * llm_graph_context::build_inp_pos() const {
-    auto inp = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd());
+ggml_tensor * llm_graph_context::build_inp_pos(bool broadcast_text) const {
+    auto inp = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd(), broadcast_text);
 
     auto & cur = inp->pos;
 

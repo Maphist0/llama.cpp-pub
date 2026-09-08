@@ -157,7 +157,8 @@ public:
 
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
-    llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
+    llm_graph_input_pos(uint32_t n_pos_per_embd, bool broadcast_text = true)
+        : n_pos_per_embd(n_pos_per_embd), broadcast_text(broadcast_text) {}
     virtual ~llm_graph_input_pos() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -167,6 +168,7 @@ public:
     ggml_tensor * pos = nullptr; // I32 [n_batch]
 
     const uint32_t n_pos_per_embd = 1;
+    const bool broadcast_text;
 };
 
 // temperature tuning, used by llama4
@@ -1161,7 +1163,7 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
-    ggml_tensor * build_inp_pos() const;
+    ggml_tensor * build_inp_pos(bool broadcast_text = true) const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
