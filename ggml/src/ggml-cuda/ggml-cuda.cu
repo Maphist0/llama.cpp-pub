@@ -1543,7 +1543,15 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
-    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
+    // Explicit F32 must not inherit the handle's TF32 math mode. GemmEx's
+    // pedantic compute type enforces this without changing shared handle state.
+    const bool require_f32 = compute_type == GGML_TYPE_F32 && GGML_CUDA_CC_IS_NVIDIA(cc) && dst->op_params[0] == GGML_PREC_F32;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (require_f32) {
+        cu_compute_type = CUBLAS_COMPUTE_32F_PEDANTIC;
+    }
+#endif
+    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1 && !require_f32) {
         CUBLAS_CHECK(
             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
@@ -1856,7 +1864,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+    // NVIDIA MMF kernels reduce F32 inputs to TF32, F16 or BF16 operands, so
+    // they cannot satisfy an explicit F32 request, including with BF16 weights.
+    const bool require_f32 = GGML_CUDA_CC_IS_NVIDIA(cc) && dst->op_params[0] == GGML_PREC_F32;
+    if (!require_f32 && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
