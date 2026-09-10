@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cassert>
@@ -16,6 +17,77 @@
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
+}
+
+bool llama_kv_cache::import_prefix(llama_context * lctx, llama_seq_id seq_id,
+                                  const std::vector<llama_pos> & positions,
+                                  const std::vector<ggml_tensor *> & keys,
+                                  const std::vector<ggml_tensor *> & values) {
+    const auto ids = get_layer_ids();
+    const size_t count = positions.size();
+    if (!lctx || seq_id < 0 || uint32_t(seq_id) >= n_seq_max || !count || count > get_size() ||
+        other || has_cell_ext() || attn_rot_k || attn_rot_v || n_swa ||
+        hparams.n_pos_per_embd() != 1 || keys.size() != ids.size() || values.size() != ids.size() ||
+        positions.front() < 0 || !std::is_sorted(positions.begin(), positions.end())) {
+        return false;
+    }
+    for (size_t i = 0; i < ids.size(); ++i) {
+        for (const bool key : {true, false}) {
+            auto t = key ? keys[i] : values[i];
+            const int head_dim = key ? hparams.n_embd_head_k(ids[i]) : hparams.n_embd_head_v(ids[i]);
+            if (!t || !t->buffer || !ggml_is_contiguous(t) || t->ne[0] != head_dim ||
+                t->ne[1] != hparams.n_head_kv(ids[i]) || t->ne[2] != int64_t(count) || t->ne[3] != 1 ||
+                (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16)) {
+                return false;
+            }
+        }
+    }
+    lctx->synchronize();
+    llama_batch_allocr balloc(1);
+    auto batch = balloc.ubatch_reserve(count, 1);
+    batch.seq_id_unq[0] = seq_id;
+    batch.seq_idx[0] = -1;
+    batch.seq_idx[seq_id] = 0;
+    for (size_t i = 0; i < count; ++i) {
+        batch.pos[i] = positions[i];
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i] = &seq_id;
+        batch.token[i] = LLAMA_TOKEN_NULL;
+    }
+    seq_rm(seq_id, -1, -1);
+    const auto slots = find_slot(batch, true);
+    if (slots.empty()) return false;
+
+    const size_t nodes = 16 * ids.size() + 32;
+    ggml_context_ptr graph_ctx(ggml_init({nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(nodes, false), nullptr, true}));
+    ggml_context_ptr input_ctx(ggml_init({2 * ggml_tensor_overhead(), nullptr, true}));
+    if (!graph_ctx || !input_ctx) return false;
+    auto * k_idxs = build_input_k_idxs(input_ctx.get(), batch);
+    auto * v_idxs = build_input_v_idxs(input_ctx.get(), batch);
+    ggml_backend_buffer_ptr input_buffer(ggml_backend_alloc_ctx_tensors_from_buft(input_ctx.get(), ggml_backend_cpu_buffer_type()));
+    if (!input_buffer) return false;
+    set_input_k_idxs(k_idxs, &batch, slots);
+    set_input_v_idxs(v_idxs, &batch, slots);
+
+    auto * graph = ggml_new_graph_custom(graph_ctx.get(), nodes, false);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        auto * k = ggml_cast(graph_ctx.get(), keys[i], GGML_TYPE_F32);
+        auto * v = ggml_cast(graph_ctx.get(), values[i], GGML_TYPE_F32);
+        ggml_build_forward_expand(graph, cpy_k(graph_ctx.get(), k, k_idxs, ids[i], slots));
+        ggml_build_forward_expand(graph, cpy_v(graph_ctx.get(), v, v_idxs, ids[i], slots));
+    }
+    // Use the context's devices but separate graph storage, so its decode graph stays valid.
+    std::vector<ggml_backend_t> backends;
+    const auto context_sched = lctx->get_sched();
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(context_sched); ++i) {
+        backends.push_back(ggml_backend_sched_get_backend(context_sched, i));
+    }
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends.data(), nullptr, backends.size(), nodes, false, true));
+    if (!sched || !ggml_backend_sched_alloc_graph(sched.get(), graph) ||
+        ggml_backend_sched_graph_compute(sched.get(), graph) != GGML_STATUS_SUCCESS) return false;
+    ggml_backend_sched_synchronize(sched.get());
+    apply_ubatch(slots, batch);
+    return true;
 }
 
 // orthonormal Walsh-Hadamard rotation matrix

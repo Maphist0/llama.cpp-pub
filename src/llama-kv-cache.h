@@ -168,6 +168,11 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    // Replace one sequence with synchronized, external post-RoPE K and unrotated V.
+    // Tensors are [head_dim, kv_heads, tokens, 1]; source storage must not alias this cache.
+    bool import_prefix(llama_context * lctx, llama_seq_id seq_id, const std::vector<llama_pos> & positions,
+                       const std::vector<ggml_tensor *> & keys, const std::vector<ggml_tensor *> & values);
+
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck
     //   sinfos_out: if set, filled with the layout used; a stream with no cells leaves an empty entry
