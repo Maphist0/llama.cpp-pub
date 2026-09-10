@@ -18508,17 +18508,23 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
         const bool split_k_shape = backend_ctx->adreno_tuned_kernels &&
             ((ne00 == 2560 && (ne01 == 1024 || ne01 == 4096 || ne01 == 9728)) ||
              (ne01 == 2560 && (ne00 == 4096 || ne00 == 9728)));
-        const bool split_k_2x4 = split_k_shape &&
-            (ne1 <= 4 || (ne1 <= 16 && ne01 != 9728) || (ne01 == 1024 && ne1 <= 64));
-        const bool split_k_4x8 = split_k_shape && !split_k_2x4 &&
-            (ne1 <= 32 || (ne01 == 9728 && ne1 <= 64)) &&
-            !(ne01 == 9728 && ne1 > 8 && ne1 <= 16);
+        // Keep the wide FFN on the original kernel above eight tokens.
+        const bool split_k_shape_4096 = backend_ctx->adreno_tuned_kernels && ne1 <= 128 &&
+            ((ne00 == 4096 && (ne01 == 1024 || ne01 == 4096 || (ne01 == 12288 && ne1 <= 8))) ||
+             (ne00 == 12288 && ne01 == 4096));
+        const bool split_k_2x4 =
+            (split_k_shape && (ne1 <= 4 || (ne1 <= 16 && ne01 != 9728) || (ne01 == 1024 && ne1 <= 64))) ||
+            (split_k_shape_4096 && (ne1 <= 4 || (ne01 == 1024 && ne1 <= 8)));
+        const bool split_k_4x8 = !split_k_2x4 &&
+            (split_k_shape_4096 || (split_k_shape &&
+             (ne1 <= 32 || (ne01 == 9728 && ne1 <= 64)) &&
+             !(ne01 == 9728 && ne1 > 8 && ne1 <= 16)));
         if (split_k_2x4) {
             kernel = backend_ctx->kernel_gemm_noshuffle_q4_k_f32_split_k_2x4;
         } else if (split_k_4x8) {
             kernel = backend_ctx->kernel_gemm_noshuffle_q4_k_f32_split_k_4x8;
         }
-        const bool shape_s8 = split_k_2x4 && ne1 == 4 && (ne01 == 1024 || ne01 == 2560) && backend_ctx->kernel_q4_split_k_2x4_s8;
+        const bool shape_s8 = split_k_shape && split_k_2x4 && ne1 == 4 && (ne01 == 1024 || ne01 == 2560) && backend_ctx->kernel_q4_split_k_2x4_s8;
         if (shape_s8) kernel = backend_ctx->kernel_q4_split_k_2x4_s8;
         const int splits = shape_s8 ? 8 : (split_k_2x4 || split_k_4x8) ? backend_ctx->q4_k_splits : 1;
         cl_mem result_buffer = extrad->data_device;
@@ -18670,7 +18676,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
 
         // dp4a (int8) dense q6_K prefill GEMM
         const bool split_k_shape = backend_ctx->adreno_tuned_kernels && ne1 <= 128 &&
-            ((ne00 == 2560 && ne01 == 1024) || (ne00 == 9728 && ne01 == 2560));
+            ((ne00 == 2560 && ne01 == 1024) || (ne00 == 9728 && ne01 == 2560) ||
+             (ne00 == 4096 && ne01 == 1024) || (ne00 == 12288 && ne01 == 4096));
         // Split the reduction to expose more workgroups and bound FP16 error.
         static const char * q6k_dense_dp4a_env = getenv("GGML_OPENCL_Q6K_DENSE_DP4A");
                      bool   q6k_dense_dp4a_on  = (q6k_dense_dp4a_env != nullptr)
