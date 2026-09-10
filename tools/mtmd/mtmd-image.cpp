@@ -747,6 +747,36 @@ clip_image_size mtmd_image_preprocessor_llava_uhd::get_best_grid(const int max_s
 // mtmd_image_preprocessor_fixed_size
 //
 
+static clip_image_u8 bagel_resize(const clip_image_u8 & img, int longest, int shortest, int stride) {
+    int width = img.get_size().width, height = img.get_size().height;
+    if (width <= 0 || height <= 0) throw std::runtime_error("BAGEL requires a nonempty image");
+    auto scale_to = [&](double scale) {
+        width = std::max(stride, int(std::nearbyint(std::nearbyint(width * scale) / stride)) * stride);
+        height = std::max(stride, int(std::nearbyint(std::nearbyint(height * scale) / stride)) * stride);
+    };
+    scale_to(std::max(std::min(double(longest) / std::max(width, height), 1.0),
+                      double(shortest) / std::min(width, height)));
+    const double max_pixels = 14 * 14 * 9 * 1024;
+    if (double(width) * height > max_pixels) scale_to(max_pixels / (double(width) * height));
+    if (std::max(width, height) > longest) scale_to(double(longest) / std::max(width, height));
+    clip_image_u8 resized;
+    img_tool::resize(img, resized, {width, height}, RESIZE_ALGO_BICUBIC, PAD_NONE, {0, 0, 0});
+    return resized;
+}
+
+clip_image_u8 mtmd_image_preprocessor_bagel::prepare_image(const clip_image_u8 & img) {
+    return bagel_resize(img, 1024, 512, 16);
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_bagel::preprocess(const clip_image_u8 & img) const {
+    // Both image experts receive the common resize before their own processing.
+    const auto common = prepare_image(img);
+    const auto resized = bagel_resize(common, 980, 224, hparams.patch_size);
+    mtmd_image_preproc_out output;
+    output.append(hparams, resized, true);
+    return output;
+}
+
 mtmd_image_preproc_out mtmd_image_preprocessor_fixed_size::preprocess(const clip_image_u8 & img) const {
     clip_image_u8 resized_image;
     int sz = hparams.image_size;

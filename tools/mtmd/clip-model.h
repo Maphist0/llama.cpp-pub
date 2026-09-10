@@ -599,6 +599,7 @@ struct clip_model {
     ggml_tensor * mm_input_norm_w = nullptr;
     ggml_tensor * mm_input_norm_b = nullptr;
     ggml_tensor * mm_0_w = nullptr;
+    ggml_tensor * mm_position_embeddings = nullptr;
     ggml_tensor * mm_0_b = nullptr;
     ggml_tensor * mm_2_w = nullptr;
     ggml_tensor * mm_2_b = nullptr;

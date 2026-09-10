@@ -1,11 +1,21 @@
 #include "models.h"
 
+static ggml_tensor * crop_positions(ggml_context * ctx, ggml_tensor * table, int width, int height) {
+    const int side = int(std::sqrt(table->ne[1]));
+    GGML_ASSERT(side * side == table->ne[1] && width <= side && height <= side);
+    auto result = ggml_view_3d(ctx, table, table->ne[0], width, height, table->nb[1], table->nb[1] * side, 0);
+    result = ggml_cont_2d(ctx, result, table->ne[0], width * height);
+    return result->type == GGML_TYPE_F32 ? result : ggml_cast(ctx, result, GGML_TYPE_F32);
+}
+
 ggml_cgraph * clip_graph_siglip::build() {
     ggml_tensor * inp = build_inp();
 
     ggml_tensor * learned_pos_embd = model.position_embeddings;
     if (proj_type == PROJECTOR_TYPE_LFM2 || proj_type == PROJECTOR_TYPE_PHI4) {
         learned_pos_embd = resize_position_embeddings();
+    } else if (proj_type == PROJECTOR_TYPE_BAGEL) {
+        learned_pos_embd = crop_positions(ctx0, learned_pos_embd, n_patches_x, n_patches_y);
     }
 
     ggml_tensor * cur = build_vit(
@@ -67,13 +77,16 @@ ggml_cgraph * clip_graph_siglip::build() {
             FFN_GELU,
             -1);
 
-    } else if (proj_type == PROJECTOR_TYPE_JANUS_PRO) {
+    } else if (proj_type == PROJECTOR_TYPE_JANUS_PRO || proj_type == PROJECTOR_TYPE_BAGEL) {
         cur = build_ffn(cur,
             model.mm_0_w, model.mm_0_b,
             nullptr, nullptr,
             model.mm_1_w, model.mm_1_b,
             hparams.ffn_op,
             -1);
+        if (proj_type == PROJECTOR_TYPE_BAGEL) {
+            cur = ggml_add(ctx0, cur, crop_positions(ctx0, model.mm_position_embeddings, n_patches_x, n_patches_y));
+        }
 
     } else if (proj_type == PROJECTOR_TYPE_PHI4) {
         cur = build_ffn(cur,
