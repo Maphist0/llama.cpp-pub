@@ -17,6 +17,8 @@ __all__ = [
 
 
 TEXT_MODEL_MAP: dict[str, str] = {
+    "Bagel": "bagel",
+    "BagelForConditionalGeneration": "bagel",
     "NEOChatModel": "sensenova_u1",
     "AfmoeForCausalLM": "afmoe",
     "LagunaForCausalLM": "laguna",
@@ -286,6 +288,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
 
 
 MMPROJ_MODEL_MAP: dict[str, str] = {
+    "BagelForConditionalGeneration": "bagel",
     "AudioFlamingo3ForConditionalGeneration": "ultravox",
     "CogVLMForCausalLM": "cogvlm",
     "DeepseekOCR2ForCausalLM": "deepseek",

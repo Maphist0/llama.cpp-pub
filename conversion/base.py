@@ -78,6 +78,7 @@ class ModelType(IntEnum):
 
 
 class ModelBase:
+    safetensors_prefix = "model"
     _model_classes: dict[ModelType, dict[str, type[ModelBase]]] = {
         ModelType.TEXT: {},
         ModelType.MMPROJ: {},
@@ -229,7 +230,7 @@ class ModelBase:
 
             return tensors
 
-        prefix = "model" if not self.is_mistral_format else "consolidated"
+        prefix = self.safetensors_prefix if not self.is_mistral_format else "consolidated"
         part_names: list[str] = ModelBase.get_model_part_names(self.dir_model, prefix, ".safetensors")
         is_safetensors: bool = len(part_names) > 0
         if not is_safetensors:
@@ -239,7 +240,7 @@ class ModelBase:
         tensor_names_from_parts: set[str] = set()
 
         if not self.is_mistral_format:
-            index_name = "model.safetensors" if is_safetensors else "pytorch_model.bin"
+            index_name = f"{prefix}.safetensors" if is_safetensors else "pytorch_model.bin"
             index_name += ".index.json"
             index_file = self.dir_model / index_name
 
@@ -2809,7 +2810,7 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
     # Kimi-K3's text_config reports "KimiLinearForCausalLM", which is the older
     # Kimi-Linear-48B architecture and cannot load K3 (no attention residuals,
     # latent MoE, situ, ...). Route on the top-level architecture instead.
-    if model_type == ModelType.TEXT and arch in ("NEOChatModel", "StepVLForConditionalGeneration", "Sarashina2VisionForCausalLM", "Exaone4_5_ForConditionalGeneration", "Step3p7ForConditionalGeneration", "KimiK3ForConditionalGeneration"):
+    if model_type == ModelType.TEXT and arch in ("Bagel", "BagelForConditionalGeneration", "NEOChatModel", "StepVLForConditionalGeneration", "Sarashina2VisionForCausalLM", "Exaone4_5_ForConditionalGeneration", "Step3p7ForConditionalGeneration", "KimiK3ForConditionalGeneration"):
         return arch
 
     # if "architectures" is found in the sub-config, use that instead

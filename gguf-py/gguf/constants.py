@@ -5817,6 +5817,7 @@ class VisionProjectorType:
     LIGHTONOCR = "lightonocr"
     COGVLM = "cogvlm"
     JANUS_PRO = "janus_pro"
+    BAGEL = "bagel"
     DOTSOCR = "dots_ocr"
     DOTS3NOTE_V = "dots3note_v"
     DOTS3NOTE_A = "dots3note_a" # audio
