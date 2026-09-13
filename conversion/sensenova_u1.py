@@ -19,7 +19,7 @@ class SenseNovaU1Model(Qwen2Model):
         return super().filter_tensors(item)
 
     def set_gguf_parameters(self):
-        if self.hparams.get("num_experts", 0):
+        if int(self.hparams.get("num_experts") or 0) > 1:
             raise ValueError("SenseNova U1 conversion currently supports the dense understanding branch")
         if self.rope_parameters.get("rope_type", "default") not in ("default", None):
             raise ValueError("SenseNova U1 scaled RoPE is not supported")
