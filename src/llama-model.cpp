@@ -1492,9 +1492,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // Keep the input embedding on the same accelerator when the complete model is
+    // offloaded.  This avoids a CPU GET_ROWS split and the following host-to-device
+    // transfer on every evaluation.  Partial-offload configurations retain the
+    // traditional host placement.
+    if (!devices.empty() && i_gpu_start == 0 && act_gpu_layers == n_layer_all + 1) {
+        pimpl->dev_input = get_layer_buft_list(0);
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);

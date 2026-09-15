@@ -33,6 +33,7 @@
 #include <stdarg.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -2209,6 +2210,7 @@ static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
     ggml_cann_set_device(cann_ctx->device);
     ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
+    cann_ctx->release_pending_rope_caches();
 }
 
 /**
@@ -2401,6 +2403,9 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
  *              otherwise false.
  */
 static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if (op->op == GGML_OP_ROPE && std::getenv("GGML_CANN_FORCE_CPU_ROPE") != nullptr) {
+        return false;
+    }
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {

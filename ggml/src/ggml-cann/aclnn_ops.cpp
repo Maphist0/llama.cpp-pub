@@ -25,6 +25,7 @@
 #include "ggml-impl.h"
 #include "ggml.h"
 
+#include <cstdlib>
 
 #include <aclnnop/aclnn_add.h>
 #include <aclnnop/aclnn_add_rms_norm.h>
@@ -1115,7 +1116,7 @@ void ggml_cann_pool2d(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
  * @param acl_dst The destination tensor where the data will be copied to.
  */
 static void cann_copy(ggml_backend_cann_context & ctx, aclTensor * acl_src, aclTensor * acl_dst) {
-    GGML_CANN_CALL_ACLNN_OP(ctx, InplaceCopy, acl_dst, acl_src);
+    GGML_CANN_CALL_ACLNN_OP_NO_CACHE(ctx, InplaceCopy, acl_dst, acl_src);
 }
 
 void ggml_cann_dup(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
@@ -2183,7 +2184,7 @@ static void aclnn_repeat_interleave(ggml_backend_cann_context & ctx,
                                     int64_t                     dim,
                                     int64_t                     repeats,
                                     int64_t                     output_size) {
-    GGML_CANN_CALL_ACLNN_OP(ctx, RepeatInterleaveIntWithDim, acl_src, repeats, dim, output_size, acl_dst);
+    GGML_CANN_CALL_ACLNN_OP_NO_CACHE(ctx, RepeatInterleaveIntWithDim, acl_src, repeats, dim, output_size, acl_dst);
 }
 
 /**
@@ -2443,7 +2444,7 @@ static void aclnn_roll(ggml_backend_cann_context & ctx,
                        int64_t *                   dims) {
     acl_int_array_ptr acl_shifts = ggml_cann_create_int_array(shifts, 1);
     acl_int_array_ptr acl_dims   = ggml_cann_create_int_array(dims, 1);
-    GGML_CANN_CALL_ACLNN_OP(ctx, Roll, acl_src, acl_shifts.get(), acl_dims.get(), acl_dst);
+    GGML_CANN_CALL_ACLNN_OP_NO_CACHE(ctx, Roll, acl_src, acl_shifts.get(), acl_dims.get(), acl_dst);
 }
 
 /**
@@ -2524,8 +2525,8 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
     int64_t position_length    = dst->ne[2];
 
     // TODO: check theta_scale_length and position_length.
-    if (src2 == nullptr && ctx.rope_cache.cached &&
-        ctx.rope_cache.equal(theta_scale_length, position_length, ext_factor, theta_scale, freq_scale, attn_factor,
+    if (src2 == nullptr && ctx.current_rope_cache().cached &&
+        ctx.current_rope_cache().equal(theta_scale_length, position_length, src1, ext_factor, theta_scale, freq_scale, attn_factor,
                              is_neox, indep_sects, mrope_used, is_imrope, sections)) {
         // use cache.
         return;
@@ -2557,64 +2558,64 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
     // Step1.1: prepare theta_scale exponent. if this exponent updated, should update theta_scale_tensor.
     acl_tensor_ptr acl_theta_scale_tensor;
     bool           theta_scale_updated = false;
-    if (ctx.rope_cache.theta_scale_length != theta_scale_length || ctx.rope_cache.theta_scale != theta_scale ||
-        ctx.rope_cache.indep_sects != indep_sects) {
+    if (ctx.current_rope_cache().theta_scale_length != theta_scale_length || ctx.current_rope_cache().theta_scale != theta_scale ||
+        ctx.current_rope_cache().indep_sects != indep_sects) {
         theta_scale_updated = true;
-        if (ctx.rope_cache.theta_scale_exp_host != nullptr) {
-            free(ctx.rope_cache.theta_scale_exp_host);
+        if (ctx.current_rope_cache().theta_scale_exp_host != nullptr) {
+            free(ctx.current_rope_cache().theta_scale_exp_host);
         }
-        ctx.rope_cache.theta_scale_exp_host = (float *) malloc(theta_scale_length * sizeof(float));
-        GGML_ASSERT(ctx.rope_cache.theta_scale_exp_host != nullptr);
+        ctx.current_rope_cache().theta_scale_exp_host = (float *) malloc(theta_scale_length * sizeof(float));
+        GGML_ASSERT(ctx.current_rope_cache().theta_scale_exp_host != nullptr);
         if (!indep_sects) {
-            ctx.rope_cache.theta_scale_exp_host[0] = 1;
+            ctx.current_rope_cache().theta_scale_exp_host[0] = 1;
             for (int i = 1; i < theta_scale_length; i++) {
-                ctx.rope_cache.theta_scale_exp_host[i] = ctx.rope_cache.theta_scale_exp_host[i - 1] * theta_scale;
+                ctx.current_rope_cache().theta_scale_exp_host[i] = ctx.current_rope_cache().theta_scale_exp_host[i - 1] * theta_scale;
             }
         } else {
             int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
             int sec_w     = sections[1] + sections[0];
             int sec_e     = sections[2] + sec_w;
 
-            ctx.rope_cache.theta_scale_exp_host[0] = 1;
+            ctx.current_rope_cache().theta_scale_exp_host[0] = 1;
             for (int i = 1; i < theta_scale_length; i++) {
                 int sector = i % sect_dims;
                 if (sector == 0 || sector == sections[0] || sector == sec_w || sector == sec_e) {
-                    ctx.rope_cache.theta_scale_exp_host[i] = 1;
+                    ctx.current_rope_cache().theta_scale_exp_host[i] = 1;
                     continue;
                 }
-                ctx.rope_cache.theta_scale_exp_host[i] = ctx.rope_cache.theta_scale_exp_host[i - 1] * theta_scale;
+                ctx.current_rope_cache().theta_scale_exp_host[i] = ctx.current_rope_cache().theta_scale_exp_host[i - 1] * theta_scale;
             }
         }
 
-        if (ctx.rope_cache.theta_scale_cache != nullptr) {
-            ACL_CHECK(aclrtFree(ctx.rope_cache.theta_scale_cache));
+        if (ctx.current_rope_cache().theta_scale_cache != nullptr) {
+            ACL_CHECK(aclrtFree(ctx.current_rope_cache().theta_scale_cache));
         }
-        ACL_CHECK(aclrtMalloc(&ctx.rope_cache.theta_scale_cache, theta_scale_length * sizeof(float),
+        ACL_CHECK(aclrtMalloc(&ctx.current_rope_cache().theta_scale_cache, theta_scale_length * sizeof(float),
                               ACL_MEM_MALLOC_HUGE_FIRST));
 
-        ACL_CHECK(aclrtMemcpyAsync(ctx.rope_cache.theta_scale_cache, theta_scale_length * sizeof(float),
-                                   ctx.rope_cache.theta_scale_exp_host, theta_scale_length * sizeof(float),
+        ACL_CHECK(aclrtMemcpyAsync(ctx.current_rope_cache().theta_scale_cache, theta_scale_length * sizeof(float),
+                                   ctx.current_rope_cache().theta_scale_exp_host, theta_scale_length * sizeof(float),
                                    ACL_MEMCPY_HOST_TO_DEVICE, ctx.stream()));
     }
-    acl_theta_scale_tensor = ggml_cann_create_tensor(ctx.rope_cache.theta_scale_cache, ACL_FLOAT, sizeof(float),
+    acl_theta_scale_tensor = ggml_cann_create_tensor(ctx.current_rope_cache().theta_scale_cache, ACL_FLOAT, sizeof(float),
                                                      theta_scale_ne, theta_scale_nb, 1);
 
     // Step1.2: prepare rope_yarn_ramp, if this part updated, should update theta_scale_tensor.
     // TODO: acl_yarn_ramp_tensor use rope cache.
     bool           yarn_ramp_tensor_updated = false;
     acl_tensor_ptr acl_yarn_ramp_tensor;
-    if (ext_factor != 0 && (theta_scale_updated || ctx.rope_cache.theta_scale_length != theta_scale_length ||
-                            ctx.rope_cache.freq_scale != freq_scale)) {
+    if (ext_factor != 0 && (theta_scale_updated || ctx.current_rope_cache().theta_scale_length != theta_scale_length ||
+                            ctx.current_rope_cache().freq_scale != freq_scale)) {
         yarn_ramp_tensor_updated = true;
-        if (ctx.rope_cache.yarn_ramp_cache != nullptr) {
-            ACL_CHECK(aclrtFree(ctx.rope_cache.yarn_ramp_cache));
+        if (ctx.current_rope_cache().yarn_ramp_cache != nullptr) {
+            ACL_CHECK(aclrtFree(ctx.current_rope_cache().yarn_ramp_cache));
         }
-        ACL_CHECK(aclrtMalloc(&ctx.rope_cache.yarn_ramp_cache, theta_scale_length * sizeof(float),
+        ACL_CHECK(aclrtMalloc(&ctx.current_rope_cache().yarn_ramp_cache, theta_scale_length * sizeof(float),
                               ACL_MEM_MALLOC_HUGE_FIRST));
         // -rope_yarn_ramp
         // const float y = (i0 / 2 - low) / MAX(0.001f, high - low);
         // return MIN(1, MAX(0, y)) - 1;
-        acl_yarn_ramp_tensor      = ggml_cann_create_tensor(ctx.rope_cache.yarn_ramp_cache, ACL_FLOAT, sizeof(float),
+        acl_yarn_ramp_tensor      = ggml_cann_create_tensor(ctx.current_rope_cache().yarn_ramp_cache, ACL_FLOAT, sizeof(float),
                                                             theta_scale_ne, theta_scale_nb, 1);
         float          zero_value = 0, one_value = 1;
         float          denom_safe_value = MAX(0.001f, corr_dims[1] - corr_dims[0]);
@@ -2646,7 +2647,7 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
         GGML_CANN_CALL_ACLNN_OP(ctx, InplaceMuls, acl_yarn_ramp_tensor.get(), freq_scale_1_sc.get());
         GGML_CANN_CALL_ACLNN_OP(ctx, InplaceAdds, acl_yarn_ramp_tensor.get(), freq_scale_sc.get(), one.get());
     } else {
-        acl_yarn_ramp_tensor = ggml_cann_create_tensor(ctx.rope_cache.yarn_ramp_cache, ACL_FLOAT, sizeof(float),
+        acl_yarn_ramp_tensor = ggml_cann_create_tensor(ctx.current_rope_cache().yarn_ramp_cache, ACL_FLOAT, sizeof(float),
                                                        theta_scale_ne, theta_scale_nb, 1);
     }
     // Step 1.3: update theta_scale_tensor according to ext_factor or freq_scale.
@@ -2656,7 +2657,7 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
             aclnn_mul(ctx, acl_theta_scale_tensor.get(), acl_yarn_ramp_tensor.get());
         }
     } else {
-        if (freq_scale != 1 && (ctx.rope_cache.freq_scale != freq_scale || theta_scale_updated)) {
+        if (freq_scale != 1 && (ctx.current_rope_cache().freq_scale != freq_scale || theta_scale_updated)) {
             theta_scale_updated = true;
             aclnn_muls(ctx, acl_theta_scale_tensor.get(), freq_scale, nullptr, true);
         }
@@ -2664,21 +2665,21 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
 
     // Nothing changed, use cache.
     if (!theta_scale_updated) {
-        acl_theta_scale_tensor = ggml_cann_create_tensor(ctx.rope_cache.theta_scale_cache, ACL_FLOAT, sizeof(float),
+        acl_theta_scale_tensor = ggml_cann_create_tensor(ctx.current_rope_cache().theta_scale_cache, ACL_FLOAT, sizeof(float),
                                                          theta_scale_ne, theta_scale_nb, GGML_MAX_DIMS);
     }
 
     // Step 1.4: prepare select index if mrope
     acl_tensor_ptr position_select_index_tensor;
     if (mrope_used) {
-        if (ctx.rope_cache.sections[0] != sections[0] || ctx.rope_cache.sections[1] != sections[1] ||
-            ctx.rope_cache.sections[2] != sections[2] || ctx.rope_cache.sections[3] != sections[3] ||
-            ctx.rope_cache.theta_scale_length != theta_scale_length || ctx.rope_cache.is_imrope != is_imrope) {
-            if (ctx.rope_cache.position_select_index_host != nullptr) {
-                free(ctx.rope_cache.position_select_index_host);
+        if (ctx.current_rope_cache().sections[0] != sections[0] || ctx.current_rope_cache().sections[1] != sections[1] ||
+            ctx.current_rope_cache().sections[2] != sections[2] || ctx.current_rope_cache().sections[3] != sections[3] ||
+            ctx.current_rope_cache().theta_scale_length != theta_scale_length || ctx.current_rope_cache().is_imrope != is_imrope) {
+            if (ctx.current_rope_cache().position_select_index_host != nullptr) {
+                free(ctx.current_rope_cache().position_select_index_host);
             }
-            ctx.rope_cache.position_select_index_host = (int *) malloc(theta_scale_length * sizeof(int));
-            GGML_ASSERT(ctx.rope_cache.position_select_index_host != nullptr);
+            ctx.current_rope_cache().position_select_index_host = (int *) malloc(theta_scale_length * sizeof(int));
+            GGML_ASSERT(ctx.current_rope_cache().position_select_index_host != nullptr);
             int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
             int sec_w     = sections[1] + sections[0];
             int sec_e     = sections[2] + sec_w;
@@ -2688,39 +2689,39 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
 
                 if (is_imrope) {  // qwen3vl apply interleaved mrope
                     if (sector % 3 == 1 && sector < 3 * sections[1]) {
-                        ctx.rope_cache.position_select_index_host[i] = 1;
+                        ctx.current_rope_cache().position_select_index_host[i] = 1;
                     } else if (sector % 3 == 2 && sector < 3 * sections[2]) {
-                        ctx.rope_cache.position_select_index_host[i] = 2;
+                        ctx.current_rope_cache().position_select_index_host[i] = 2;
                     } else if (sector % 3 == 0 && sector < 3 * sections[0]) {
-                        ctx.rope_cache.position_select_index_host[i] = 0;
+                        ctx.current_rope_cache().position_select_index_host[i] = 0;
                     } else {
-                        ctx.rope_cache.position_select_index_host[i] = 3;
+                        ctx.current_rope_cache().position_select_index_host[i] = 3;
                     }
                 } else {
                     if (sector >= sections[0] && sector < sec_w) {
-                        ctx.rope_cache.position_select_index_host[i] = 1;
+                        ctx.current_rope_cache().position_select_index_host[i] = 1;
                     } else if (sector >= sec_w && sector < sec_e) {
-                        ctx.rope_cache.position_select_index_host[i] = 2;
+                        ctx.current_rope_cache().position_select_index_host[i] = 2;
                     } else if (sector >= sec_e) {
-                        ctx.rope_cache.position_select_index_host[i] = 3;
+                        ctx.current_rope_cache().position_select_index_host[i] = 3;
                     } else {
-                        ctx.rope_cache.position_select_index_host[i] = 0;
+                        ctx.current_rope_cache().position_select_index_host[i] = 0;
                     }
                 }
             }
 
-            if (ctx.rope_cache.position_select_index != nullptr) {
-                ACL_CHECK(aclrtFree(ctx.rope_cache.position_select_index));
+            if (ctx.current_rope_cache().position_select_index != nullptr) {
+                ACL_CHECK(aclrtFree(ctx.current_rope_cache().position_select_index));
             }
-            ACL_CHECK(aclrtMalloc(&ctx.rope_cache.position_select_index, theta_scale_length * sizeof(int),
+            ACL_CHECK(aclrtMalloc(&ctx.current_rope_cache().position_select_index, theta_scale_length * sizeof(int),
                                   ACL_MEM_MALLOC_HUGE_FIRST));
 
-            ACL_CHECK(aclrtMemcpyAsync(ctx.rope_cache.position_select_index, theta_scale_length * sizeof(int),
-                                       ctx.rope_cache.position_select_index_host, theta_scale_length * sizeof(int),
+            ACL_CHECK(aclrtMemcpyAsync(ctx.current_rope_cache().position_select_index, theta_scale_length * sizeof(int),
+                                       ctx.current_rope_cache().position_select_index_host, theta_scale_length * sizeof(int),
                                        ACL_MEMCPY_HOST_TO_DEVICE, ctx.stream()));
         }
 
-        position_select_index_tensor = ggml_cann_create_tensor(ctx.rope_cache.position_select_index, ACL_INT32,
+        position_select_index_tensor = ggml_cann_create_tensor(ctx.current_rope_cache().position_select_index, ACL_INT32,
                                                                sizeof(int), theta_scale_ne, theta_scale_nb, 1);
     }
 
@@ -2818,19 +2819,19 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
 
     // Step5: calculate sin cos.
     // init sin_repeat && cos_repeat, only to accelerate first layer on each device
-    if (position_length > ctx.rope_cache.position_length) {
-        ctx.rope_cache.position_length = position_length;
-        if (ctx.rope_cache.sin_cache != nullptr) {
-            ACL_CHECK(aclrtFree(ctx.rope_cache.sin_cache));
+    if (position_length > ctx.current_rope_cache().position_length) {
+        ctx.current_rope_cache().position_length = position_length;
+        if (ctx.current_rope_cache().sin_cache != nullptr) {
+            ACL_CHECK(aclrtFree(ctx.current_rope_cache().sin_cache));
         }
-        if (ctx.rope_cache.cos_cache != nullptr) {
-            ACL_CHECK(aclrtFree(ctx.rope_cache.cos_cache));
+        if (ctx.current_rope_cache().cos_cache != nullptr) {
+            ACL_CHECK(aclrtFree(ctx.current_rope_cache().cos_cache));
         }
         int64_t repeat_theta_length = theta_scale_length * position_length * 2;
         ACL_CHECK(
-            aclrtMalloc(&ctx.rope_cache.sin_cache, repeat_theta_length * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
+            aclrtMalloc(&ctx.current_rope_cache().sin_cache, repeat_theta_length * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
         ACL_CHECK(
-            aclrtMalloc(&ctx.rope_cache.cos_cache, repeat_theta_length * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
+            aclrtMalloc(&ctx.current_rope_cache().cos_cache, repeat_theta_length * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
     }
 
     // sin/cos
@@ -2862,9 +2863,9 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
     for (int i = 1; i < GGML_MAX_DIMS; i++) {
         sin_reshape_nb[i] = sin_reshape_nb[i - 1] * sin_reshape_ne[i - 1];
     }
-    acl_tensor_ptr acl_sin_repeat_tensor = ggml_cann_create_tensor(ctx.rope_cache.sin_cache, ACL_FLOAT, sizeof(float),
+    acl_tensor_ptr acl_sin_repeat_tensor = ggml_cann_create_tensor(ctx.current_rope_cache().sin_cache, ACL_FLOAT, sizeof(float),
                                                                    sin_reshape_ne, sin_reshape_nb, GGML_MAX_DIMS);
-    acl_tensor_ptr acl_cos_repeat_tensor = ggml_cann_create_tensor(ctx.rope_cache.cos_cache, ACL_FLOAT, sizeof(float),
+    acl_tensor_ptr acl_cos_repeat_tensor = ggml_cann_create_tensor(ctx.current_rope_cache().cos_cache, ACL_FLOAT, sizeof(float),
                                                                    sin_reshape_ne, sin_reshape_nb, GGML_MAX_DIMS);
 
     // Step 6: repeat
@@ -2883,8 +2884,8 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
     }
 
     // Update cached value.
-    ctx.rope_cache.cached = true;
-    ctx.rope_cache.set(theta_scale_length, position_length, ext_factor, theta_scale, freq_scale, attn_factor, is_neox,
+    ctx.current_rope_cache().cached = true;
+    ctx.current_rope_cache().set(theta_scale_length, position_length, src1, ext_factor, theta_scale, freq_scale, attn_factor, is_neox,
                        indep_sects, mrope_used, is_imrope, sections);
 }
 
@@ -2968,6 +2969,14 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     int64_t tail_dims = ne00 - rope_dims;
     bool    has_tail  = tail_dims > 0;
 
+    if (std::getenv("GGML_CANN_TRACE_ROPE") != nullptr) {
+        GGML_LOG_INFO("%s: device=%d n_dims=%d shape=[%lld,%lld,%lld,%lld] mode=%d\n",
+                      __func__, ctx.device, n_dims,
+                      (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne03, mode);
+    }
+
+    ctx.begin_rope_call();
+
     // init ctx.rope_cos/rope_sin cache
     aclnn_rope_cache_init(ctx, dst, corr_dims, ext_factor, theta_scale, freq_scale, attn_factor, is_neox, sections,
                           mrope_used, is_imrope, is_vision, rope_dims);
@@ -2979,9 +2988,9 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     for (int i = 1; i < GGML_MAX_DIMS; i++) {
         sin_reshape_nb[i] = sin_reshape_nb[i - 1] * sin_reshape_ne[i - 1];
     }
-    acl_tensor_ptr acl_sin_reshape_tensor = ggml_cann_create_tensor(ctx.rope_cache.sin_cache, ACL_FLOAT, sizeof(float),
+    acl_tensor_ptr acl_sin_reshape_tensor = ggml_cann_create_tensor(ctx.current_rope_cache().sin_cache, ACL_FLOAT, sizeof(float),
                                                                     sin_reshape_ne, sin_reshape_nb, GGML_MAX_DIMS);
-    acl_tensor_ptr acl_cos_reshape_tensor = ggml_cann_create_tensor(ctx.rope_cache.cos_cache, ACL_FLOAT, sizeof(float),
+    acl_tensor_ptr acl_cos_reshape_tensor = ggml_cann_create_tensor(ctx.current_rope_cache().cos_cache, ACL_FLOAT, sizeof(float),
                                                                     sin_reshape_ne, sin_reshape_nb, GGML_MAX_DIMS);
 
     acl_tensor_ptr acl_src = ggml_cann_create_tensor(src0);
@@ -3123,6 +3132,7 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         aclnn_add(ctx, input_fp32_tensor1.get(), input_fp32_tensor2.get(), output_fp32_tensor.get());
         aclnn_cast(ctx, output_fp32_tensor.get(), acl_dst.get(), ACL_FLOAT16);
     }
+    ctx.end_rope_call();
     return;
 #endif
     int64_t acl_mode = is_neox ? 0 : 1;
@@ -3265,6 +3275,7 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     if (src_dst_need_trans) {
         aclnn_cast(ctx, acl_dst_trans_tensor.get(), acl_dst.get(), ACL_FLOAT16);
     }
+    ctx.end_rope_call();
 }
 
 void ggml_cann_rope_cache_preload(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
@@ -3316,7 +3327,7 @@ void ggml_cann_rope_cache_preload(ggml_backend_cann_context & ctx, ggml_tensor *
     // into the captured graph.  The cache metadata (theta_scale_length,
     // theta_scale, sections, position_length, etc.) remains set, which causes
     // all host-to-device copy and malloc/free branches to be skipped.
-    ctx.rope_cache.cached = false;
+    ctx.current_rope_cache().cached = false;
 }
 
 void ggml_cann_argmax(ggml_backend_cann_context & ctx, ggml_tensor * dst) {

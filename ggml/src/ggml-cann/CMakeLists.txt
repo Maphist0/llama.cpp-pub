@@ -57,6 +57,7 @@ if (CANN_INSTALL_DIR)
         ${CANN_INSTALL_DIR}/include
         ${CANN_INSTALL_DIR}/include/aclnn
         ${CANN_INSTALL_DIR}/acllib/include
+        ${CANN_INSTALL_DIR}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc
     )
 
     list(APPEND CANN_LIBRARIES
@@ -71,7 +72,7 @@ if (CANN_INSTALL_DIR)
     ggml_add_backend_library(ggml-cann ${GGML_SOURCES_CANN})
     target_link_libraries(ggml-cann PRIVATE ${CANN_LIBRARIES})
     target_include_directories(ggml-cann PRIVATE ${CANN_INCLUDE_DIRS})
-    target_link_directories(ggml-cann PRIVATE ${CANN_INSTALL_DIR}/lib64)
+    target_link_directories(ggml-cann PUBLIC ${CANN_INSTALL_DIR}/lib64)
 
     target_compile_definitions(ggml-cann PRIVATE "-D${SOC_TYPE_COMPILE_OPTION}")
 

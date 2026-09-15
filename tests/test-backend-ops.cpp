@@ -5772,6 +5772,159 @@ struct test_rope : public test_case {
     }
 };
 
+// SenseNova U1.5 generation uses three independent NEOX RoPE axes.  Keep an
+// exact-shape case here because the generic RoPE matrix does not cover its
+// 5,000,000 temporal base or repeated 2-D position patterns.
+struct test_rope_sensenova_u15 : public test_case {
+    const std::string axis;
+    const int64_t dims;
+    const int64_t heads;
+    const int64_t token_width;
+    const int64_t token_height;
+    const int32_t prefix_length;
+    const float freq_base;
+    const int32_t n_ctx_orig;
+
+    test_rope_sensenova_u15(std::string axis, int64_t dims, int64_t heads,
+            int64_t token_width, int64_t token_height, int32_t prefix_length,
+            float freq_base, int32_t n_ctx_orig)
+        : axis(std::move(axis)), dims(dims), heads(heads), token_width(token_width),
+          token_height(token_height), prefix_length(prefix_length), freq_base(freq_base),
+          n_ctx_orig(n_ctx_orig) {}
+
+    std::string vars() override {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "sensenova_u15_axis=%s,dims=%" PRId64 ",heads=%" PRId64
+                 ",tokens=%" PRId64 ",freq_base=%.0f,prefix=%d",
+                 axis.c_str(), dims, heads, token_width * token_height, freq_base, prefix_length);
+        return buf;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dims, heads,
+                                             token_width * token_height, 1);
+        ggml_set_param(a);
+        ggml_set_name(a, "sensenova_u15_input");
+
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, token_width * token_height);
+        ggml_set_name(pos, "sensenova_u15_position");
+
+        ggml_tensor * out = ggml_rope_ext(ctx, a, pos, nullptr, dims, GGML_ROPE_TYPE_NEOX,
+                                          n_ctx_orig, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+
+            std::vector<int32_t> positions(token_width * token_height);
+            for (int64_t i = 0; i < token_width * token_height; ++i) {
+                if (axis == "temporal") {
+                    positions[i] = prefix_length;
+                } else if (axis == "height") {
+                    positions[i] = i / token_width;
+                } else {
+                    positions[i] = i % token_width;
+                }
+            }
+            ggml_backend_tensor_set(t, positions.data(), 0, positions.size() * sizeof(int32_t));
+        }
+    }
+
+    double max_maa_err() override {
+        return 1e-3;
+    }
+};
+
+struct test_rope_sensenova_u15_cache_axes : public test_case {
+    const int64_t token_width;
+    const int64_t token_height;
+    const int32_t prefix_length;
+
+    test_rope_sensenova_u15_cache_axes(int64_t token_width, int64_t token_height, int32_t prefix_length)
+        : token_width(token_width), token_height(token_height), prefix_length(prefix_length) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return "ROPE_CACHE_AXES";
+    }
+
+    std::string vars() override {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "sensenova_u15_cache_axes,tokens=%" PRId64 ",prefix=%d",
+                 token_width * token_height, prefix_length);
+        return buf;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t tokens = token_width * token_height;
+        auto make_input = [&](const char * name, int64_t dims) {
+            ggml_tensor * input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dims, 8, tokens, 1);
+            ggml_set_param(input);
+            ggml_set_name(input, name);
+            return input;
+        };
+        auto make_pos = [&](const char * name) {
+            ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
+            ggml_set_name(pos, name);
+            return pos;
+        };
+        auto rotate = [&](ggml_tensor * input, ggml_tensor * pos, int dims, float base, int n_ctx) {
+            return ggml_rope_ext(ctx, input, pos, nullptr, dims, GGML_ROPE_TYPE_NEOX,
+                                 n_ctx, base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        };
+
+        ggml_tensor * pos_t = make_pos("sensenova_u15_position_temporal");
+        ggml_tensor * pos_h = make_pos("sensenova_u15_position_height");
+        ggml_tensor * pos_w = make_pos("sensenova_u15_position_width");
+
+        auto make_qk = [&](const char * prefix) {
+            ggml_tensor * temporal = rotate(make_input((std::string(prefix) + "_temporal").c_str(), 64),
+                                            pos_t, 64, 5000000.0f, 262144);
+            ggml_tensor * height = rotate(make_input((std::string(prefix) + "_height").c_str(), 32),
+                                          pos_h, 32, 10000.0f, 10000);
+            ggml_tensor * width = rotate(make_input((std::string(prefix) + "_width").c_str(), 32),
+                                         pos_w, 32, 10000.0f, 10000);
+            return ggml_concat(ctx, temporal, ggml_concat(ctx, height, width, 0), 0);
+        };
+
+        ggml_tensor * out = ggml_concat(ctx, make_qk("q"), make_qk("k"), 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+
+            std::vector<int32_t> positions(token_width * token_height);
+            const std::string name = t->name;
+            for (int64_t i = 0; i < token_width * token_height; ++i) {
+                if (name.find("temporal") != std::string::npos) {
+                    positions[i] = prefix_length;
+                } else if (name.find("height") != std::string::npos) {
+                    positions[i] = i / token_width;
+                } else {
+                    positions[i] = i % token_width;
+                }
+            }
+            ggml_backend_tensor_set(t, positions.data(), 0, positions.size() * sizeof(int32_t));
+        }
+    }
+
+    double max_maa_err() override {
+        return 1e-3;
+    }
+};
+
 // GGML_OP_POOL2D
 struct test_pool2d : public test_case {
     enum ggml_op_pool pool_type;
@@ -10179,6 +10332,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // inplace with an offset
         test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
     }
+
+    // SenseNova U1.5 256x256 generation token grid (8x8), including the exact
+    // temporal and spatial bases and position patterns used by the model.
+    test_cases.emplace_back(new test_rope_sensenova_u15("temporal", 64, 32, 8, 8, 258, 5000000.0f, 262144));
+    test_cases.emplace_back(new test_rope_sensenova_u15("height",   32, 32, 8, 8, 258,   10000.0f,  10000));
+    test_cases.emplace_back(new test_rope_sensenova_u15("width",    32, 32, 8, 8, 258,   10000.0f,  10000));
+    test_cases.emplace_back(new test_rope_sensenova_u15("temporal", 64, 32, 64, 64, 258, 5000000.0f, 262144));
+    test_cases.emplace_back(new test_rope_sensenova_u15("height",   32, 32, 64, 64, 258,   10000.0f,  10000));
+    test_cases.emplace_back(new test_rope_sensenova_u15("width",    32, 32, 64, 64, 258,   10000.0f,  10000));
+    test_cases.emplace_back(new test_rope_sensenova_u15_cache_axes(8, 8, 258));
+    test_cases.emplace_back(new test_rope_sensenova_u15_cache_axes(64, 64, 258));
 
     for (int v : { 0, 1, 2, 3 }) {
         for (int dim : { 0, 1, 2, 3, }) {
