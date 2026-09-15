@@ -78,16 +78,21 @@ llama_model_sensenova_u1::graph::graph(const llama_model_sensenova_u1 & model, c
         x = normalize(x, ggml_reshape_2d(ctx0, weight, n_embd_head/2, 2));
         x = ggml_reshape_3d(ctx0, x, n_embd_head, heads, n_tokens);
 
-        // Normalize temporal and spatial halves separately; rotate time, height, then width.
-        for (int axis = 0; axis < 3; ++axis) {
-            const int dims = axis == 0 ? n_embd_head/2 : n_embd_head/4;
-            const int offset = axis == 0 ? 0 : n_embd_head/2 + (axis - 1)*n_embd_head/4;
-            const float base = axis == 0 ? freq_base : model.rope_freq_base_spatial;
-            x = ggml_rope_ext(ctx0, x, pos[axis], nullptr, dims, GGML_ROPE_TYPE_NEOX,
+        // Apply each axis to a contiguous slice.  Besides avoiding repeated copies of
+        // the unrotated channels, this lets accelerators execute the three ordinary
+        // RoPE operations without requiring support for ggml_rope_set_offset().
+        auto rotate_axis = [&](int axis, int64_t offset, int64_t dims, float base) {
+            auto * slice = ggml_view_3d(ctx0, x, dims, heads, n_tokens,
+                                       x->nb[1], x->nb[2], offset*x->nb[0]);
+            slice = ggml_cont(ctx0, slice);
+            return ggml_rope_ext(ctx0, slice, pos[axis], nullptr, dims, GGML_ROPE_TYPE_NEOX,
                     n_ctx_orig, base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-            ggml_rope_set_offset(x, offset);
-        }
-        return x;
+        };
+
+        auto * temporal = rotate_axis(0, 0,             n_embd_head/2, freq_base);
+        auto * height   = rotate_axis(1, n_embd_head/2, n_embd_head/4, model.rope_freq_base_spatial);
+        auto * width    = rotate_axis(2, 3*n_embd_head/4, n_embd_head/4, model.rope_freq_base_spatial);
+        return ggml_concat(ctx0, ggml_concat(ctx0, temporal, height, 0), width, 0);
     };
 
     auto * inp_attn = build_attn_inp_kv();

@@ -1294,6 +1294,22 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
+    // Validation mode for deployments that require every graph operation to run
+    // on an accelerator.  Inputs and outputs may still reside in host buffers,
+    // but assigning any actual compute node to the trailing CPU fallback is an
+    // error.  Keep this check independent of GGML_SCHED_DEBUG so it has negligible
+    // overhead and does not emit the full graph for every evaluation.
+    if (getenv("GGML_SCHED_STRICT_ACCEL") != nullptr) {
+        const int cpu_backend_id = sched->n_backends - 1;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (!ggml_is_view_op(node->op) && tensor_backend_id(node) == cpu_backend_id) {
+                GGML_ABORT("%s: strict accelerator mode rejected CPU node #%d (%s, name='%s')\n",
+                           __func__, i, ggml_op_desc(node), node->name);
+            }
+        }
+    }
+
     // pass 5: split graph, find tensors that need to be copied
     {
         int i_split = 0;

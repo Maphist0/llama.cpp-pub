@@ -24,6 +24,7 @@
 #define CANN_ACLNN_OPS
 
 #include "acl_tensor.h"
+#include <aclnn/opdev/op_executor.h>
 #include "common.h"
 
 #include <aclnnop/aclnn_abs.h>
@@ -926,6 +927,20 @@ void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * 
             void *          workspaceAddr = nullptr;                                             \
             ACL_CHECK(aclnn##OP_NAME##GetWorkspaceSize(__VA_ARGS__, &workspaceSize, &executor)); \
             /* workspace should alloced in main thread to keep malloc order when using vmm. */   \
+            if (workspaceSize > 0) {                                                             \
+                ggml_cann_pool_alloc workspace_allocator(CTX.pool(), workspaceSize);             \
+                workspaceAddr = workspace_allocator.get();                                       \
+            }                                                                                    \
+            ACL_CHECK(aclnn##OP_NAME(workspaceAddr, workspaceSize, executor, CTX.stream()));     \
+        } while (0)
+
+#    define GGML_CANN_CALL_ACLNN_OP_NO_CACHE(CTX, OP_NAME, ...)                                  \
+        do {                                                                                     \
+            uint64_t        workspaceSize = 0;                                                   \
+            aclOpExecutor * executor;                                                            \
+            void *          workspaceAddr = nullptr;                                             \
+            ACL_CHECK(aclnn##OP_NAME##GetWorkspaceSize(__VA_ARGS__, &workspaceSize, &executor)); \
+            executor->AbandonCache();                                                            \
             if (workspaceSize > 0) {                                                             \
                 ggml_cann_pool_alloc workspace_allocator(CTX.pool(), workspaceSize);             \
                 workspaceAddr = workspace_allocator.get();                                       \

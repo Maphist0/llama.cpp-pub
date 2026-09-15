@@ -474,6 +474,7 @@ struct ggml_cann_rope_cache {
 
     bool equal(int64_t theta_scale_length,
                int64_t position_length,
+               const ggml_tensor * position_tensor,
                float   ext_factor,
                float   theta_scale,
                float   freq_scale,
@@ -484,6 +485,7 @@ struct ggml_cann_rope_cache {
                bool    is_imrope,
                int     sections[4]) {
         return this->theta_scale_length == theta_scale_length && this->position_length == position_length &&
+               this->position_tensor == position_tensor &&
                this->ext_factor == ext_factor && this->theta_scale == theta_scale && this->freq_scale == freq_scale &&
                this->attn_factor == attn_factor && this->is_neox == is_neox && this->indep_sects == indep_sects &&
                this->mrope_used == mrope_used && this->is_imrope == is_imrope && this->sections[0] == sections[0] &&
@@ -492,6 +494,7 @@ struct ggml_cann_rope_cache {
 
     void set(int64_t theta_scale_length,
              int64_t position_length,
+             const ggml_tensor * position_tensor,
              float   ext_factor,
              float   theta_scale,
              float   freq_scale,
@@ -503,6 +506,7 @@ struct ggml_cann_rope_cache {
              int     sections[4]) {
         this->theta_scale_length = theta_scale_length;
         this->position_length    = position_length;
+        this->position_tensor    = position_tensor;
         this->ext_factor         = ext_factor;
         this->theta_scale        = theta_scale;
         this->freq_scale         = freq_scale;
@@ -529,6 +533,7 @@ struct ggml_cann_rope_cache {
     // Properties to check before reusing the sincos cache
     int64_t theta_scale_length         = 0;
     int64_t position_length            = 0;
+    const ggml_tensor * position_tensor = nullptr;
     bool    cached                     = false;
     float   ext_factor                 = 0.0f;
     float   theta_scale                = 0.0f;
@@ -568,6 +573,14 @@ struct ggml_backend_cann_context {
     bool                   async_mode;
     // Rope Cache
     ggml_cann_rope_cache   rope_cache;
+#ifdef ASCEND_310P
+    // ACLNN kernels used by the 310P RoPE path may consume their inputs after
+    // returning from the launch call.  Keep each RoPE call's coefficient and
+    // sin/cos buffers distinct until backend synchronization instead of
+    // overwriting the single shared cache from the next axis.
+    ggml_cann_rope_cache * active_rope_cache = nullptr;
+    std::vector<std::unique_ptr<ggml_cann_rope_cache>> pending_rope_caches;
+#endif
     // Constant Pool
     ggml_cann_tensor_cache rms_norm_one_tensor_cache;
     ggml_cann_tensor_cache rms_norm_zero_tensor_cache;
@@ -594,6 +607,10 @@ struct ggml_backend_cann_context {
      */
     ~ggml_backend_cann_context() {
         ggml_cann_set_device(device);
+#ifdef ASCEND_310P
+        active_rope_cache = nullptr;
+        pending_rope_caches.clear();
+#endif
         if (copy_event != nullptr) {
             ACL_CHECK(aclrtDestroyEvent(copy_event));
         }
@@ -645,6 +662,36 @@ struct ggml_backend_cann_context {
             mem_pool = new_pool_for_device(device);
         }
         return *mem_pool;
+    }
+
+    ggml_cann_rope_cache & current_rope_cache() {
+#ifdef ASCEND_310P
+        if (active_rope_cache != nullptr) {
+            return *active_rope_cache;
+        }
+#endif
+        return rope_cache;
+    }
+
+    void begin_rope_call() {
+#ifdef ASCEND_310P
+        auto cache       = std::make_unique<ggml_cann_rope_cache>();
+        active_rope_cache = cache.get();
+        pending_rope_caches.push_back(std::move(cache));
+#endif
+    }
+
+    void end_rope_call() {
+#ifdef ASCEND_310P
+        active_rope_cache = nullptr;
+#endif
+    }
+
+    void release_pending_rope_caches() {
+#ifdef ASCEND_310P
+        active_rope_cache = nullptr;
+        pending_rope_caches.clear();
+#endif
     }
 };
 
