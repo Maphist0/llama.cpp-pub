@@ -2265,6 +2265,61 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
     ggml_tensor * src0 = dst->src[0];  // weight
     ggml_tensor * src1 = dst->src[1];  // input
 
+#ifdef ASCEND_310P
+    // WeightQuantBatchMatmulV2 on 310P only accepts FP16 activations and
+    // produces FP16 output. BAGEL repeatedly applies the understanding expert
+    // to two boundary tokens during diffusion; rounding both sides of every
+    // Q8 matmul accumulates enough error to destroy the latent. For this
+    // small-M case, expand one Q8 matrix into a temporary FP16 buffer and use
+    // the regular mixed-precision MatMul path. The Q8 weights remain resident
+    // and the pool reuses at most one matrix-sized temporary allocation.
+    if (type == GGML_TYPE_Q8_0 && src1->ne[1] == 2 &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        src1->ne[2] == 1 && src1->ne[3] == 1) {
+        const int64_t k      = src0->ne[0];
+        const int64_t m      = src0->ne[1];
+        const int64_t groups = k / QK8_0;
+        GGML_ASSERT(k % QK8_0 == 0);
+
+        const size_t quant_bytes = size_t(k) * size_t(m);
+        void * scale_data = static_cast<char *>(src0->data) + quant_bytes;
+
+        ggml_cann_pool_alloc dequant_allocator(ctx.pool());
+        void * dequant_data = dequant_allocator.alloc(quant_bytes * sizeof(uint16_t));
+
+        // Views are expressed in ggml dimension order and reversed by the
+        // ACL tensor helper. This represents [m, groups, 32], with the scale
+        // repeated over the innermost group dimension via a zero stride.
+        int64_t grouped_ne[] = { QK8_0, groups, m };
+        size_t quant_nb[]    = { sizeof(int8_t), QK8_0 * sizeof(int8_t), size_t(k) * sizeof(int8_t) };
+        size_t dequant_nb[]  = { sizeof(uint16_t), QK8_0 * sizeof(uint16_t), size_t(k) * sizeof(uint16_t) };
+        size_t scale_nb[]    = { 0, sizeof(uint16_t), size_t(groups) * sizeof(uint16_t) };
+
+        auto acl_quant = ggml_cann_create_tensor(src0->data, ACL_INT8, sizeof(int8_t),
+                                                  grouped_ne, quant_nb, 3);
+        auto acl_scale = ggml_cann_create_tensor(scale_data, ACL_FLOAT16, sizeof(uint16_t),
+                                                  grouped_ne, scale_nb, 3);
+        auto acl_dequant = ggml_cann_create_tensor(dequant_data, ACL_FLOAT16, sizeof(uint16_t),
+                                                    grouped_ne, dequant_nb, 3);
+        aclnn_cast(ctx, acl_quant.get(), acl_dequant.get(), ACL_FLOAT16);
+        aclnn_mul(ctx, acl_dequant.get(), acl_scale.get(), nullptr);
+
+        int64_t input_ne[]  = { k, src1->ne[1] };
+        size_t input_nb[]   = { src1->nb[0], src1->nb[1] };
+        int64_t weight_ne[] = { m, k };
+        size_t weight_nb[]  = { size_t(k) * sizeof(uint16_t), sizeof(uint16_t) };
+        int64_t output_ne[] = { m, dst->ne[1] };
+        size_t output_nb[]  = { dst->nb[0], dst->nb[1] };
+
+        auto acl_input = ggml_cann_create_tensor(src1, input_ne, input_nb, 2);
+        auto acl_weight = ggml_cann_create_tensor(dequant_data, ACL_FLOAT16, sizeof(uint16_t),
+                                                   weight_ne, weight_nb, 2);
+        auto acl_output = ggml_cann_create_tensor(dst, output_ne, output_nb, 2);
+        GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input.get(), acl_weight.get(), acl_output.get(), 2);
+        return;
+    }
+#endif
+
     // The shape of the weight is NCHW.
     // Matrix multiplication uses HW dims.
     // HC is regarded as batch.

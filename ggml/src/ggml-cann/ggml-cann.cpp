@@ -2444,6 +2444,12 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             break;
         case GGML_OP_MUL_MAT:
             {
+                if (op->type == GGML_TYPE_F16 && op->src[1]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                if (op->type != GGML_TYPE_F16 && op->type != GGML_TYPE_F32) {
+                    return false;
+                }
                 switch (op->src[0]->type) {
 #ifndef ASCEND_310P
                     case GGML_TYPE_BF16:
@@ -2452,9 +2458,10 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     case GGML_TYPE_F32:
                         return true;
                     case GGML_TYPE_Q8_0:
+                        return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
                     case GGML_TYPE_Q4_0:
 #ifdef ASCEND_310P
-                        // Q4 && Q8 per group is not support on 310p device
+                        // Grouped Q4 is not supported on 310P.
                         return false;
 #endif
                         // only support contiguous for quantized types.
