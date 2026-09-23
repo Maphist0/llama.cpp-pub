@@ -2316,7 +2316,9 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
     size_t               output_elem_size = sizeof(uint16_t);
     size_t               output_nb[]      = { output_elem_size, dst->ne[0] * output_elem_size };
     ggml_cann_pool_alloc output_allocator(ctx.pool());
-    void *               output_buffer = output_allocator.alloc(ggml_nelements(dst) * output_elem_size);
+    void *               output_buffer = dst->type == GGML_TYPE_F16
+                                             ? dst->data
+                                             : output_allocator.alloc(ggml_nelements(dst) * output_elem_size);
     size_t               output_stride = dst->ne[0] * dst->ne[1] * output_elem_size;
 
     // aclnn
