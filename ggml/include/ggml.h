@@ -1437,6 +1437,12 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    GGML_API struct ggml_tensor * ggml_mul_mat_out_type(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            enum ggml_type        type);
+
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_API void ggml_mul_mat_set_prec(
@@ -2100,6 +2106,18 @@ extern "C" {
             int                   p1,  // padding dimension 1
             int                   d0,  // dilation dimension 0
             int                   d1); // dilation dimension 1
+
+    GGML_API struct ggml_tensor * ggml_conv_2d_out_type(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,   // convolution kernel
+            struct ggml_tensor  * b,   // data
+            int                   s0,  // stride dimension 0
+            int                   s1,  // stride dimension 1
+            int                   p0,  // padding dimension 0
+            int                   p1,  // padding dimension 1
+            int                   d0,  // dilation dimension 0
+            int                   d1,  // dilation dimension 1
+            enum ggml_type        type);
 
     GGML_API struct ggml_tensor * ggml_im2col_3d(
             struct ggml_context * ctx,
