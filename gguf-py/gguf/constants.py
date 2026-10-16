@@ -641,6 +641,7 @@ class MODEL_ARCH(IntEnum):
     EXAONE           = auto()
     EXAONE4          = auto()
     EXAONE_MOE       = auto()
+    MOBILEMOE        = auto()
     GRANITE          = auto()
     GRANITE_MOE      = auto()
     GRANITE_HYBRID   = auto()
@@ -1456,6 +1457,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.EXAONE:           "exaone",
     MODEL_ARCH.EXAONE4:          "exaone4",
     MODEL_ARCH.EXAONE_MOE:       "exaone-moe",
+    MODEL_ARCH.MOBILEMOE:        "mobilemoe",
     MODEL_ARCH.GRANITE:          "granite",
     MODEL_ARCH.GRANITE_MOE:      "granitemoe",
     MODEL_ARCH.GRANITE_HYBRID:   "granitehybrid",
@@ -6028,6 +6030,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_SHEXP,
     ],
 }
+
+MODEL_TENSORS[MODEL_ARCH.MOBILEMOE] = MODEL_TENSORS[MODEL_ARCH.EXAONE_MOE]
 
 # tensors that will not be serialized
 MODEL_TENSOR_SKIP: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {

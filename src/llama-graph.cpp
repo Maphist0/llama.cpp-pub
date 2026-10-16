@@ -1658,6 +1658,31 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * slots) const {
+    if (arch == LLM_ARCH_MOBILEMOE && hparams.moe_qat_output_grouped) {
+        GGML_ASSERT(w->type == GGML_TYPE_Q4_0 && w_s == nullptr && slots == nullptr && loras->empty());
+        const int64_t n_out = w->ne[0];
+        const int64_t n_in = w->ne[1];
+        const int64_t n_used = ids->ne[0];
+        const int64_t n_tok = ids->ne[1];
+        GGML_ASSERT(cur->ne[0] == n_in);
+        if (n_tok > 0 && n_used * n_tok < w->ne[2]) {
+            // Decode only selected experts for small batches; weights stay packed.
+            auto * flat = ggml_reshape_2d(ctx0, w, n_out * n_in, w->ne[2]);
+            auto * chosen = ggml_get_rows(ctx0, flat, ggml_reshape_1d(ctx0, ggml_cont(ctx0, ids), n_used * n_tok));
+            chosen = ggml_cast(ctx0, ggml_cast(ctx0, chosen, GGML_TYPE_BF16), GGML_TYPE_F32);
+            chosen = ggml_reshape_4d(ctx0, chosen, n_out, n_in, n_used, n_tok);
+            chosen = ggml_cont(ctx0, ggml_permute(ctx0, chosen, 1, 0, 2, 3));
+            auto * input = ggml_reshape_4d(ctx0, cur, n_in, 1, cur->ne[1], n_tok);
+            input = ggml_repeat_4d(ctx0, input, n_in, 1, n_used, n_tok);
+            auto * result = ggml_mul_mat(ctx0, chosen, input);
+            return ggml_reshape_3d(ctx0, result, n_out, n_used, n_tok);
+        }
+        // Large batches reuse each decoded expert across its selected tokens.
+        auto * dense = ggml_cast(ctx0, w, GGML_TYPE_F32);
+        dense = ggml_cast(ctx0, ggml_cast(ctx0, dense, GGML_TYPE_BF16), GGML_TYPE_F32);
+        dense = ggml_cont(ctx0, ggml_permute(ctx0, dense, 1, 0, 2, 3));
+        return ggml_mul_mat_id(ctx0, dense, cur, ids);
+    }
     cur = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
