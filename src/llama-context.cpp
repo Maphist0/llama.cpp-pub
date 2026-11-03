@@ -14,6 +14,9 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include "ggml-cpu.h"
+#include <thread>
+#include <future>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -230,6 +233,8 @@ llama_context::llama_context(
                                hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
                                                               hparams.n_ctx_train;
 
+    cparams.cb_expert           = params.cb_expert;
+    cparams.cb_expert_user_data = params.cb_expert_user_data;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
@@ -1542,7 +1547,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_expert ? expert_eval : cparams.cb_eval, cparams.cb_expert ? this : cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -2739,6 +2744,144 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
     LLAMA_LOG_INFO("%s: graph reallocation: nodes = %d (changed = %d), splits = %d, n_same = %d, n_diff = %d\n",
             __func__, ggml_graph_n_nodes(gf), graph_size_changed, ggml_backend_sched_get_n_splits(sched),
             lctx->n_reallocs_same, lctx->n_reallocs_diff);
+}
+
+bool llama_context::expert_eval(ggml_tensor * tensor, bool ask, void * data) {
+    auto & ctx = *static_cast<llama_context *>(data);
+    int il;
+    if (sscanf(tensor->name, "expert_parallel-%d", &il) != 1) {
+        return ctx.cparams.cb_eval ? ctx.cparams.cb_eval(tensor, ask, ctx.cparams.cb_eval_user_data) : false;
+    }
+    if (ask) {
+        return true;
+    }
+    const auto * ids = tensor->src[1];
+    const int64_t k = ids->ne[0], n = ids->ne[1], d = tensor->ne[0];
+    std::vector<int32_t> selected(k*n);
+    std::vector<uint8_t> gpu(k*n, 0);
+    std::vector<float> input(d*n), output(d*k*n, 0.0f);
+    ggml_backend_tensor_get(ids, selected.data(), 0, ggml_nbytes(ids));
+    ggml_backend_tensor_get(tensor->src[0], input.data(), 0, input.size()*sizeof(float));
+    ctx.cparams.cb_expert(il, ctx.expert_invocation++, n, k, selected.data(), gpu.data(), ctx.cparams.cb_expert_user_data);
+    ggml_backend_t backend_gpu = nullptr;
+    for (auto & b : ctx.backends) {
+        const auto type = ggml_backend_dev_type(ggml_backend_get_device(b.get()));
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            backend_gpu = b.get();
+            break;
+        }
+    }
+    for (int64_t i = 0; i < k*n; ++i) {
+        if (gpu[i] > 1 || selected[i] < 0 || uint32_t(selected[i]) >= ctx.model.hparams.n_expert || (gpu[i] && !backend_gpu)) {
+            throw std::runtime_error("invalid expert assignment or unavailable GPU");
+        }
+        LLAMA_LOG_INFO("ep_route layer=%d token=%lld slot=%lld expert=%d backend=%s\n", il,
+            (long long) (i/k), (long long) (i%k), selected[i], gpu[i] ? ggml_backend_name(backend_gpu) : "CPU");
+    }
+    ggml_backend_ptr cpu(ggml_backend_cpu_init());
+    ggml_backend_cpu_set_n_threads(cpu.get(), ctx.cparams.n_threads);
+    struct branch {
+        ggml_context_ptr meta;
+        ggml_backend_buffer_ptr buffer;
+        ggml_cgraph * graph;
+        std::vector<std::pair<ggml_tensor *, std::vector<uint8_t>>> inputs;
+        std::vector<std::pair<ggml_tensor *, int64_t>> outputs;
+    } branches[2];
+    const auto & layer = ctx.model.layers.at(il);
+    for (int b = 0; b < 2; ++b) {
+        auto & branch = branches[b];
+        int64_t count = 0;
+        for (auto assignment : gpu) {
+            count += assignment == b;
+        }
+        if (!count) {
+            continue;
+        }
+        const size_t nodes = 48*count + 16;
+        branch.meta.reset(ggml_init({ nodes*ggml_tensor_overhead() + ggml_graph_overhead_custom(nodes, false), nullptr, true }));
+        if (!branch.meta) {
+            throw std::runtime_error("expert graph allocation failed");
+        }
+        auto * meta = branch.meta.get();
+        branch.graph = ggml_new_graph_custom(meta, nodes, false);
+        for (int64_t i = 0; i < k*n; ++i) {
+            if (gpu[i] != b) {
+                continue;
+            }
+            auto * zero = ggml_new_tensor_1d(meta, GGML_TYPE_I32, 1);
+            branch.inputs.emplace_back(zero, std::vector<uint8_t>(sizeof(int32_t), 0));
+            auto weight = [&](ggml_tensor * source, const char * stage) {
+                const int64_t rows = source->ne[0], cols = source->ne[1];
+                auto * storage = ggml_new_tensor_1d(meta, source->type, rows*cols);
+                auto * packed = ggml_view_2d(meta, storage, rows*cols, 1, ggml_nbytes(storage), 0);
+                std::vector<uint8_t> bytes(ggml_nbytes(packed));
+                ggml_backend_tensor_get(source, bytes.data(), selected[i]*source->nb[2], bytes.size());
+                branch.inputs.emplace_back(packed, std::move(bytes));
+                auto * decoded = ggml_get_rows(meta, packed, zero);
+                ggml_format_name(decoded, "ep.layer%d.expert%d.slot%lld.%s.decode", il, selected[i], (long long) i, stage);
+                decoded = ggml_reshape_2d(meta, decoded, rows, cols);
+                return ggml_cont(meta, ggml_transpose(meta, decoded));
+            };
+            auto * up = weight(layer.ffn_up_exps, "up");
+            auto * gate = weight(layer.ffn_gate_exps, "gate");
+            auto * down = weight(layer.ffn_down_exps, "down");
+            auto * x = ggml_new_tensor_2d(meta, GGML_TYPE_F32, d, 1);
+            branch.inputs.emplace_back(x, std::vector<uint8_t>(d*sizeof(float)));
+            memcpy(branch.inputs.back().second.data(), input.data()+(i/k)*d, d*sizeof(float));
+            auto * up_out = ggml_mul_mat(meta, up, x);
+            auto * gate_out = ggml_mul_mat(meta, gate, x);
+            ggml_format_name(up_out, "ep.layer%d.expert%d.slot%lld.up", il, selected[i], (long long) i);
+            ggml_format_name(gate_out, "ep.layer%d.expert%d.slot%lld.gate", il, selected[i], (long long) i);
+            auto * act = ggml_swiglu_split(meta, gate_out, up_out);
+            auto * out = ggml_mul_mat(meta, down, act);
+            ggml_format_name(out, "ep.layer%d.expert%d.slot%lld", il, selected[i], (long long) i);
+            ggml_build_forward_expand(branch.graph, out);
+            branch.outputs.emplace_back(out, i);
+        }
+        auto * backend = b ? backend_gpu : cpu.get();
+        branch.buffer.reset(ggml_backend_alloc_ctx_tensors(meta, backend));
+        if (!branch.buffer) {
+            throw std::runtime_error("expert backend allocation failed");
+        }
+        for (auto & in : branch.inputs) {
+            ggml_backend_tensor_set(in.first, in.second.data(), 0, in.second.size());
+            LLAMA_LOG_INFO("ep_upload layer=%d backend=%s type=%s bytes=%zu\n", il, ggml_backend_name(backend), ggml_type_name(in.first->type), in.second.size());
+        }
+        for (int i = 0; i < ggml_graph_n_nodes(branch.graph); ++i) {
+            if (!ggml_backend_supports_op(backend, ggml_graph_node(branch.graph, i))) {
+                throw std::runtime_error(std::string("expert branch operation unsupported on assigned backend: ")+ggml_op_name(ggml_graph_node(branch.graph, i)->op));
+            }
+        }
+    }
+    ggml_status status[2] = { GGML_STATUS_SUCCESS, GGML_STATUS_SUCCESS };
+    std::promise<void> submitted;
+    auto ready = submitted.get_future();
+    auto run = [&](int b) {
+        auto & branch = branches[b];
+        if (branch.outputs.empty()) {
+            if (b) { submitted.set_value(); }
+            return;
+        }
+        auto * backend = b ? backend_gpu : cpu.get();
+        const int64_t start = ggml_time_us();
+        status[b] = ggml_backend_graph_compute_async(backend, branch.graph);
+        if (b) { submitted.set_value(); }
+        ggml_backend_synchronize(backend);
+        const int64_t end = ggml_time_us();
+        LLAMA_LOG_INFO("ep_execute layer=%d backend=%s start_us=%lld end_us=%lld\n", il, ggml_backend_name(backend), (long long) start, (long long) end);
+        for (auto & out : branch.outputs) {
+            ggml_backend_tensor_get(out.first, output.data()+out.second*d, 0, d*sizeof(float));
+        }
+    };
+    std::thread gpu_worker([&]() { run(1); });
+    ready.wait();
+    run(0);
+    gpu_worker.join();
+    if (status[0] != GGML_STATUS_SUCCESS || status[1] != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error("expert branch execution failed");
+    }
+    ggml_backend_tensor_set(tensor, output.data(), 0, output.size()*sizeof(float));
+    return true;
 }
 
 ggml_status llama_context::graph_compute(
@@ -4057,6 +4200,8 @@ llama_context_params llama_context_default_params() {
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
+        /*.cb_expert                   =*/ nullptr,
+        /*.cb_expert_user_data         =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,

@@ -24,9 +24,10 @@ struct block_q4_0
 //------------------------------------------------------------------------------
 void dequantize_q4_0_f32(global struct block_q4_0 * xb, short il, float16 * reg) {
     global ushort * qs = ((global ushort *)xb + 1);
-    float d1 = il ? (xb->d / 16.h) : xb->d;
+    const float scale = xb->d;
+    float d1 = il ? scale / 16.f : scale;
     float d2 = d1 / 256.f;
-    float md = -8.h * xb->d;
+    float md = -8.f * scale;
     ushort mask0 = il ? 0x00F0 : 0x000F;
     ushort mask1 = mask0 << 8;
 

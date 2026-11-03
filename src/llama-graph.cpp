@@ -1647,6 +1647,31 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w_s,
           ggml_tensor * slots) const {
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
+    if (arch == LLM_ARCH_MOBILEMOE && hparams.moe_qat_output_grouped) {
+        GGML_ASSERT(w->type == GGML_TYPE_Q4_0 && w_s == nullptr && slots == nullptr && loras->empty());
+        const int64_t n_out = w->ne[0];
+        const int64_t n_in = w->ne[1];
+        const int64_t n_used = ids->ne[0];
+        const int64_t n_tok = ids->ne[1];
+        GGML_ASSERT(cur->ne[0] == n_in);
+        if (n_tok > 0 && n_used * n_tok < w->ne[2]) {
+            // Decode only selected experts for small batches; weights stay packed.
+            auto * flat = ggml_reshape_2d(ctx0, w, n_out * n_in, w->ne[2]);
+            auto * chosen = ggml_get_rows(ctx0, flat, ggml_reshape_1d(ctx0, ggml_cont(ctx0, ids), n_used * n_tok));
+            chosen = ggml_cast(ctx0, ggml_cast(ctx0, chosen, GGML_TYPE_BF16), GGML_TYPE_F32);
+            chosen = ggml_reshape_4d(ctx0, chosen, n_out, n_in, n_used, n_tok);
+            chosen = ggml_cont(ctx0, ggml_permute(ctx0, chosen, 1, 0, 2, 3));
+            auto * input = ggml_reshape_4d(ctx0, cur, n_in, 1, cur->ne[1], n_tok);
+            input = ggml_repeat_4d(ctx0, input, n_in, 1, n_used, n_tok);
+            auto * result = ggml_mul_mat(ctx0, chosen, input);
+            return ggml_reshape_3d(ctx0, result, n_out, n_used, n_tok);
+        }
+        // Large batches reuse each decoded expert across its selected tokens.
+        auto * dense = ggml_cast(ctx0, w, GGML_TYPE_F32);
+        dense = ggml_cast(ctx0, ggml_cast(ctx0, dense, GGML_TYPE_BF16), GGML_TYPE_F32);
+        dense = ggml_cont(ctx0, ggml_permute(ctx0, dense, 1, 0, 2, 3));
+        return ggml_mul_mat_id(ctx0, dense, cur, ids);
+    }
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
@@ -2314,6 +2339,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    if (cparams.cb_expert) {
+        if (!hparams.moe_qat_output_grouped || !gate_exps || gate_up_exps || type_op != LLM_FFN_SILU || weight_before_ffn || !loras->empty()) {
+            throw std::runtime_error("expert policy currently requires MobileMoE QAT SiLU experts without LoRA");
+        }
+        ggml_tensor * args[] = { cur, ggml_cont(ctx0, selected_experts) };
+        experts = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_expert_used, n_tokens, 1, args, 2,
+            [](ggml_tensor *, int, int, void *) {}, 1, nullptr);
+        ggml_format_name(experts, "expert_parallel-%d", il);
+        ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu);
+    } else {
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff*2, n_expert_used, n_tokens]
@@ -2477,6 +2512,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
+    }
+
     }
 
     // an expert output can be scaled by a norm weight, then normalized, before the router weights apply

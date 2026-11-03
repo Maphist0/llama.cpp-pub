@@ -11435,8 +11435,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     return true;
                 case GGML_TYPE_Q4_0:
 #ifdef GGML_OPENCL_SOA_Q
-                    // We do not support flattened Q4_0 (and possibly other Q's)
-                    return false;
+                    // Raw views retain the packed Q4_0 layout used by get_rows.
+                    return op->src[0]->buffer &&
+                        ggml_backend_buffer_get_type(op->src[0]->buffer) == ggml_backend_dev_buffer_type(dev) &&
+                        !ggml_cl_is_q4_0_soa(op->src[0]);
 #else // GGML_OPENCL_SOA_Q
                     return true;
 #endif // GGML_OPENCL_SOA_Q

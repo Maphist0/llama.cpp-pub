@@ -2708,6 +2708,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
+        {"--expert-policy"}, "{all-cpu,all-gpu,alternating,expert-id,rotating}",
+        "assign routed experts to CPU or GPU (experimental)",
+        [](common_params & params, const std::string & value) {
+            if (value != "all-cpu" && value != "all-gpu" && value != "alternating" && value != "expert-id" && value != "rotating") {
+                throw std::invalid_argument("unknown expert policy: " + value);
+            }
+            params.expert_policy = value;
+        }
+    ));
+    add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {

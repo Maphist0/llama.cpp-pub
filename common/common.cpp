@@ -4,6 +4,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "expert-policy.h"
 
 #include "../src/llama-ext.h"
 
@@ -1772,6 +1773,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.pooling_type      = params.pooling_type;
     cparams.attention_type    = params.attention_type;
     cparams.flash_attn_type   = params.flash_attn_type;
+    const auto expert_policy = common_expert_policy_from_name(params.expert_policy);
+    cparams.cb_expert           = expert_policy.callback;
+    cparams.cb_expert_user_data = expert_policy.user_data;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;

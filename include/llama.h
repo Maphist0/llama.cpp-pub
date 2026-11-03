@@ -364,6 +364,9 @@ extern "C" {
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
+    // Assign each [token, top-k slot] to CPU (0) or GPU (1), after routing.
+    typedef void (*llama_expert_callback)(int32_t layer, uint64_t invocation, int32_t n_tokens, int32_t k, const int32_t * ids, uint8_t * gpu, void * user_data);
+
     struct llama_context_params {
         uint32_t n_ctx;                 // text context, 0 = from model
         uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
@@ -393,6 +396,8 @@ extern "C" {
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
+        llama_expert_callback cb_expert;
+        void * cb_expert_user_data;
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
